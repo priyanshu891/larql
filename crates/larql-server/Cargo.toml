@@ -18,6 +18,7 @@ path = "src/main.rs"
 larql-vindex = { path = "../larql-vindex" }
 larql-inference = { path = "../larql-inference" }
 larql-models = { path = "../larql-models" }
+larql-lql = { path = "../larql-lql" }
 larql-router-protocol = { path = "../larql-router-protocol" }
 
 axum = { version = "0.8", features = ["ws"] }

@@ -12,6 +12,7 @@ pub mod error;
 pub mod etag;
 pub mod ffn_l2_cache;
 pub mod grpc;
+pub mod lql_session;
 pub mod ratelimit;
 pub mod routes;
 pub mod session;

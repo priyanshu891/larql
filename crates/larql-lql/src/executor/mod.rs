@@ -402,5 +402,16 @@ impl Session {
         self.mutations_since_minor += 1;
         self.mutations_since_major += 1;
     }
+
+    /// Number of patch operations currently queued in the active patch
+    /// recording session (anonymous or named). Returns 0 if no recording
+    /// is active. HTTP adapters use this to compute a per-call delta
+    /// around `execute(Statement::Insert { .. })`.
+    pub fn pending_patch_op_count(&self) -> usize {
+        self.patch_recording
+            .as_ref()
+            .map(|r| r.operations.len())
+            .unwrap_or(0)
+    }
 }
 

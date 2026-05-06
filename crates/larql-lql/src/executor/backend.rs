@@ -157,4 +157,31 @@ impl Session {
             _ => None,
         }
     }
+
+    /// Swap this session's `PatchedVindex` with an external one, in place.
+    ///
+    /// Used by HTTP adapters (e.g. `larql-server`) that want the full LQL
+    /// Compose pipeline — including `balance_installed` and
+    /// `cross_fact_regression_check` — to mutate the server's own
+    /// `PatchedVindex` rather than a parallel copy. The caller swaps its
+    /// PatchedVindex in before executing an INSERT statement, then swaps
+    /// it back out once the statement completes. Cross-fact session
+    /// state (`installed_edges`, `raw_install_residuals`,
+    /// `decoy_residual_cache`) lives on `Session` itself and is untouched
+    /// by the swap, so it accumulates across calls as intended.
+    ///
+    /// Returns `LqlError::NoBackend` if the session does not hold a
+    /// `Backend::Vindex`.
+    pub fn swap_patched_vindex(
+        &mut self,
+        other: &mut larql_vindex::PatchedVindex,
+    ) -> Result<(), LqlError> {
+        match &mut self.backend {
+            Backend::Vindex { patched, .. } => {
+                std::mem::swap(patched, other);
+                Ok(())
+            }
+            _ => Err(LqlError::NoBackend),
+        }
+    }
 }

@@ -12,6 +12,7 @@ use tokio::sync::RwLock;
 
 use crate::cache::DescribeCache;
 use crate::ffn_l2_cache::FfnL2Cache;
+use crate::lql_session::LqlSessionManager;
 use crate::session::SessionManager;
 
 /// A single loaded model.
@@ -143,6 +144,11 @@ pub struct AppState {
     pub api_key: Option<String>,
     /// Per-session PatchedVindex manager.
     pub sessions: SessionManager,
+    /// Per-session LQL executor manager — owns the cross-fact accumulators
+    /// (`installed_edges`, `raw_install_residuals`, `decoy_residual_cache`)
+    /// used by the Compose INSERT pipeline. Keyed by `X-Session-Id` or
+    /// the `"__global__"` fallback for header-less requests.
+    pub lql_sessions: LqlSessionManager,
     /// DESCRIBE result cache.
     pub describe_cache: DescribeCache,
 }

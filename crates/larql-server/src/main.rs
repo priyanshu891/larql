@@ -14,6 +14,7 @@ use larql_vindex::{
 };
 
 use larql_server::cache::DescribeCache;
+use larql_server::lql_session::LqlSessionManager;
 use larql_server::session::SessionManager;
 use larql_server::state::{AppState, LoadedModel, model_id_from_name, load_probe_labels};
 use larql_server::{announce, auth, grpc, ratelimit, routes};
@@ -406,6 +407,7 @@ async fn main() -> Result<(), BoxError> {
         requests_served: std::sync::atomic::AtomicU64::new(0),
         api_key: cli.api_key.clone(),
         sessions: SessionManager::new(3600),
+        lql_sessions: LqlSessionManager::new(),
         describe_cache: DescribeCache::new(cli.cache_ttl),
     });
 
