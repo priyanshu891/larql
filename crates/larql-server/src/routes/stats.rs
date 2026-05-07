@@ -93,8 +93,8 @@ pub async fn handle_stats(
 ) -> Result<Json<serde_json::Value>, ServerError> {
     state.bump_requests();
     let model = state.model_or_err(None)?;
-    let stats = build_stats(model);
-    Ok(Json(add_q4k_ffn(model, stats).await))
+    let stats = build_stats(&model);
+    Ok(Json(add_q4k_ffn(&model, stats).await))
 }
 
 #[utoipa::path(
@@ -113,6 +113,6 @@ pub async fn handle_stats_multi(
 ) -> Result<Json<serde_json::Value>, ServerError> {
     state.bump_requests();
     let model = state.model_or_err(Some(&model_id))?;
-    let stats = build_stats(model);
-    Ok(Json(add_q4k_ffn(model, stats).await))
+    let stats = build_stats(&model);
+    Ok(Json(add_q4k_ffn(&model, stats).await))
 }

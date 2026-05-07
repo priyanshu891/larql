@@ -181,7 +181,7 @@ async fn stream_describe_messages(
     };
 
     let model = match state.model(None) {
-        Some(m) => Arc::clone(m),
+        Some(m) => m,
         None => return vec![ws_error("no model loaded")],
     };
 
@@ -285,7 +285,7 @@ async fn handle_stream_infer(
     };
 
     let model = match state.model(None) {
-        Some(m) => Arc::clone(m),
+        Some(m) => m,
         None => {
             send_error(socket, "no model loaded").await;
             return;
@@ -537,13 +537,19 @@ mod tests {
     }
 
     fn test_state(models: Vec<Arc<LoadedModel>>) -> Arc<AppState> {
+        let slots: Vec<Arc<crate::slot::ModelSlot>> = models
+            .into_iter()
+            .map(|m| Arc::new(crate::slot::ModelSlot::from_loaded(m)))
+            .collect();
         Arc::new(AppState {
-            models,
+            models: std::sync::RwLock::new(slots),
             started_at: std::time::Instant::now(),
             requests_served: AtomicU64::new(0),
             api_key: None,
             sessions: SessionManager::new(3600),
             describe_cache: DescribeCache::new(0),
+            vindex_dir: None,
+            extract_jobs: crate::routes::extract::ExtractJobs::new(),
         })
     }
 

@@ -198,8 +198,11 @@ impl LoadedModel {
 
 /// Shared application state.
 pub struct AppState {
-    /// Loaded models, keyed by model ID.
-    pub models: Vec<Arc<LoadedModel>>,
+    /// All known vindex slots (loaded or discovered).  Wrapped in a
+    /// `std::sync::RwLock` so the extract pipeline + `POST /v1/vindexes/{id}/load`
+    /// can push newly-built vindexes at runtime.  Reads are short — snapshot
+    /// Arcs and release immediately; never hold the guard across `.await`.
+    pub models: std::sync::RwLock<Vec<Arc<crate::slot::ModelSlot>>>,
     /// Server start time for uptime reporting.
     pub started_at: std::time::Instant,
     /// Request counter.
@@ -210,36 +213,56 @@ pub struct AppState {
     pub sessions: SessionManager,
     /// DESCRIBE result cache.
     pub describe_cache: DescribeCache,
+    /// Workspace directory slots were discovered from, if any.  Reported
+    /// to `GET /v1/vindexes` and required by `POST /v1/vindexes/extract`.
+    pub vindex_dir: Option<PathBuf>,
+    /// In-process extract job registry, populated by the extract route.
+    pub extract_jobs: crate::routes::extract::ExtractJobs,
 }
 
 impl AppState {
-    /// Get model by ID, or the only model if single-model serving.
-    pub fn model(&self, id: Option<&str>) -> Option<&Arc<LoadedModel>> {
-        match id {
-            Some(id) => self.models.iter().find(|m| m.id == id),
-            None if self.models.len() == 1 => self.models.first(),
-            None => None,
-        }
-    }
+    // ── Backwards-compatible accessors ──────────────────────────────
+    //
+    // These preserve the pre-refactor API (`state.model(...)`,
+    // `state.model_or_err(...)`) so the ~50 existing handler call sites
+    // don't need a line-by-line rewrite.  They consult the slot registry
+    // and return the already-loaded model if resident; newly-discovered
+    // slots (unloaded) read as `None` here.
 
-    /// Whether this is multi-model serving.
-    pub fn is_multi_model(&self) -> bool {
-        self.models.len() > 1
-    }
-
-    pub fn bump_requests(&self) {
-        self.requests_served
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Get a model by ID, or return a `NotFound` error.
+    /// Get model by ID, or the only loaded model when no id is given.
+    /// Returns `None` for Discovered-but-unloaded slots — existing
+    /// handlers do not wait on a load.
     ///
-    /// Consolidates the 23+ identical `state.model(...).ok_or_else(|| ...)` call
-    /// sites scattered across the route handlers.
+    /// When `id` is `None` we pick the sole *loaded* slot: workspace
+    /// discovery registers additional vindexes as `Discovered`, and
+    /// those shouldn't be counted as ambiguity for the single-model
+    /// path (`/v1/describe`, `/v1/walk`, ...).
+    pub fn model(&self, id: Option<&str>) -> Option<Arc<LoadedModel>> {
+        let guard = self.models.read().ok()?;
+        let slot = match id {
+            Some(id) => guard.iter().find(|s| s.id == id).cloned(),
+            None => {
+                let mut loaded = guard
+                    .iter()
+                    .filter(|s| s.loaded_unchecked().is_some());
+                let first = loaded.next().cloned();
+                if loaded.next().is_some() {
+                    return None; // >1 loaded → ambiguous
+                }
+                first
+            }
+        }?;
+        drop(guard);
+        slot.loaded_unchecked()
+    }
+
+    /// Get a model by ID, or return a `NotFound` error.  Consolidates the
+    /// ~50 identical `state.model(...).ok_or_else(|| ...)` call sites in
+    /// the handlers.
     pub fn model_or_err(
         &self,
         id: Option<&str>,
-    ) -> Result<&Arc<LoadedModel>, crate::error::ServerError> {
+    ) -> Result<Arc<LoadedModel>, crate::error::ServerError> {
         self.model(id).ok_or_else(|| {
             let msg = match id {
                 Some(mid) => format!("model '{}' not found", mid),
@@ -247,6 +270,120 @@ impl AppState {
             };
             crate::error::ServerError::NotFound(msg)
         })
+    }
+
+    /// Whether this server is serving more than one *loaded* model.
+    /// Discovered-but-unloaded slots (from workspace scan) don't count
+    /// — the router chooses single-model routing so a server booted
+    /// against one vindex still exposes `/v1/describe` even when the
+    /// workspace directory happens to contain others.
+    pub fn is_multi_model(&self) -> bool {
+        let Ok(guard) = self.models.read() else {
+            return false;
+        };
+        guard
+            .iter()
+            .filter(|s| s.loaded_unchecked().is_some())
+            .count()
+            > 1
+    }
+
+    /// True when the server has no slots registered at all.
+    pub fn is_empty(&self) -> bool {
+        self.models.read().map(|g| g.is_empty()).unwrap_or(true)
+    }
+
+    pub fn bump_requests(&self) {
+        self.requests_served
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // ── Slot accessors ──────────────────────────────────────────────
+
+    /// Snapshot the current slot list.  Call this at the top of any
+    /// handler that needs to iterate and then `.await` — never hold the
+    /// raw read guard across an await point.
+    pub fn snapshot_slots(&self) -> Vec<Arc<crate::slot::ModelSlot>> {
+        self.models
+            .read()
+            .map(|g| g.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Snapshot of every slot that is currently `Loaded`, for call sites
+    /// that need a `LoadedModel` without triggering a lazy load (e.g. the
+    /// boot-time warmup loops and the OpenAI-compat `/v1/models` listing).
+    pub fn eager_models(&self) -> Vec<Arc<LoadedModel>> {
+        self.snapshot_slots()
+            .into_iter()
+            .filter_map(|s| s.loaded_unchecked())
+            .collect()
+    }
+
+    /// Find a slot by id.  When `id` is `None`, returns the sole *loaded*
+    /// slot — discovered-only slots from workspace scan don't count as
+    /// ambiguity, mirroring the semantics of [`Self::model`].  Never
+    /// triggers a load.
+    pub fn find_slot(&self, id: Option<&str>) -> Option<Arc<crate::slot::ModelSlot>> {
+        let guard = self.models.read().ok()?;
+        match id {
+            Some(id) => guard.iter().find(|s| s.id == id).cloned(),
+            None => {
+                let mut loaded = guard
+                    .iter()
+                    .filter(|s| s.loaded_unchecked().is_some());
+                let first = loaded.next().cloned();
+                if loaded.next().is_some() {
+                    return None;
+                }
+                // Fall through to "exactly one slot, loaded or not" for
+                // the LQL path so `resolve(None)` can trigger a lazy
+                // load on a sole discovered slot.
+                first.or_else(|| {
+                    if guard.len() == 1 {
+                        Some(Arc::clone(&guard[0]))
+                    } else {
+                        None
+                    }
+                })
+            }
+        }
+    }
+
+    /// Register a new slot discovered at runtime (e.g. completed extract).
+    /// No-ops when a slot with the same id already exists.
+    pub fn add_slot(&self, slot: Arc<crate::slot::ModelSlot>) -> bool {
+        let mut guard = match self.models.write() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        if guard.iter().any(|s| s.id == slot.id) {
+            return false;
+        }
+        guard.push(slot);
+        true
+    }
+
+    /// Resolve to a loaded model, triggering a lazy load if necessary.
+    /// Used by endpoints (LQL, /v1/vindexes) that are session-driven and
+    /// may target an unloaded slot.
+    pub async fn resolve(
+        &self,
+        id: Option<&str>,
+    ) -> Result<Arc<LoadedModel>, crate::error::ServerError> {
+        let slot = self.find_slot(id).ok_or_else(|| match id {
+            Some(id) => crate::error::ServerError::NotFound(format!("model '{id}' not found")),
+            None if self.is_empty() => {
+                crate::error::ServerError::NotFound("no vindexes registered".into())
+            }
+            None => crate::error::ServerError::BadRequest(
+                "multiple models registered; pass `?model=<id>` or use a per-model path".into(),
+            ),
+        })?;
+
+        slot.get_or_load()
+            .await
+            .map_err(|e| crate::error::ServerError::Internal(format!("failed to load model: {e}")))
     }
 }
 

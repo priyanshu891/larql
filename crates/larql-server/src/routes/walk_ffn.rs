@@ -671,14 +671,14 @@ fn run_walk_ffn(state: &AppState, req: &WalkFfnRequest) -> Result<serde_json::Va
     validate_residual(req, hidden)?;
 
     let scan_layers = collect_scan_layers(req)?;
-    validate_owned(model, &scan_layers)?;
+    validate_owned(&model, &scan_layers)?;
 
     let start = std::time::Instant::now();
 
     if req.full_output {
-        run_full_output(model, req, &scan_layers, start)
+        run_full_output(&model, req, &scan_layers, start)
     } else {
-        run_features_only(model, req, &scan_layers, start)
+        run_features_only(&model, req, &scan_layers, start)
     }
 }
 
@@ -733,9 +733,9 @@ pub async fn handle_walk_ffn(
                 .ok_or_else(|| ServerError::NotFound("no model loaded".into()))?;
             validate_residual(&req, model.config.hidden_size)?;
             let scan_layers = collect_scan_layers(&req)?;
-            validate_owned(model, &scan_layers)?;
+            validate_owned(&model, &scan_layers)?;
             let start = std::time::Instant::now();
-            let out = run_full_output_core(model, &req, &scan_layers, start)?;
+            let out = run_full_output_core(&model, &req, &scan_layers, start)?;
             if model.release_mmap_after_request {
                 let patched = model.patched.blocking_read();
                 patched.base().release_mmap_pages();

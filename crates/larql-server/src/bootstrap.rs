@@ -603,6 +603,13 @@ pub struct Cli {
     /// Same format as `larql run --moe-units-manifest`. Mutually exclusive with --moe-shards.
     #[arg(long, value_name = "PATH")]
     pub moe_units_manifest: Option<PathBuf>,
+
+    /// Workspace directory containing vindex subfolders. Discovered but
+    /// unloaded vindexes are surfaced via `GET /v1/vindexes`; extracts
+    /// land here. CLI flag takes precedence over the `LARQL_VINDEX_DIR`
+    /// env var.
+    #[arg(long, value_name = "PATH", env = "LARQL_VINDEX_DIR")]
+    pub vindex_dir: Option<PathBuf>,
 }
 
 // ── Server lifecycle ──────────────────────────────────────────────────────────
@@ -754,13 +761,59 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
                 }
             });
 
+    // Wrap every eagerly-loaded model in a `ModelSlot` in the `Loaded`
+    // state.  Later discovery (runtime-loaded vindexes, extracts) appends
+    // new slots to the same registry.
+    let mut slots: Vec<Arc<crate::slot::ModelSlot>> = models
+        .iter()
+        .map(|m| Arc::new(crate::slot::ModelSlot::from_loaded(Arc::clone(m))))
+        .collect();
+
+    // Scan the workspace directory for on-disk vindexes that weren't
+    // eagerly loaded and register them as `Discovered` slots so the
+    // `/v1/vindexes` list sees them without paying the load cost up
+    // front.  `POST /v1/vindexes/{id}/load` promotes a slot to `Loaded`
+    // on demand.
+    if let Some(ref dir) = cli.vindex_dir {
+        let loaded_ids: std::collections::HashSet<String> =
+            slots.iter().map(|s| s.id.clone()).collect();
+        let slot_opts = crate::slot::SlotLoadOpts {
+            no_infer: cli.no_infer,
+            ffn_only: cli.ffn_only,
+            embed_only: cli.embed_only,
+            layer_range,
+            max_gate_cache_layers: cli.max_gate_cache_layers,
+            max_q4k_cache_layers: cli.max_q4k_cache_layers,
+            hnsw: if cli.hnsw { Some(cli.hnsw_ef_search) } else { None },
+            warmup_hnsw: cli.warmup_hnsw,
+            release_mmap_after_request: cli.release_mmap_after_request,
+            expert_filter,
+            unit_filter: None,
+            moe_remote: None,
+        };
+        for p in discover_vindexes(dir) {
+            match crate::slot::ModelSlot::discover(p.clone(), slot_opts.clone()) {
+                Ok(slot) => {
+                    if loaded_ids.contains(&slot.id) {
+                        continue;
+                    }
+                    info!("  Discovered (unloaded): {}", slot.id);
+                    slots.push(Arc::new(slot));
+                }
+                Err(e) => warn!("  Skipping {}: {}", p.display(), e),
+            }
+        }
+    }
+
     let state = Arc::new(AppState {
-        models: models.clone(),
+        models: std::sync::RwLock::new(slots),
         started_at: std::time::Instant::now(),
         requests_served: std::sync::atomic::AtomicU64::new(0),
         api_key: cli.api_key.clone(),
         sessions: SessionManager::new(DEFAULT_SESSION_TTL_SECS),
         describe_cache: DescribeCache::new(cli.cache_ttl),
+        vindex_dir: cli.vindex_dir.clone(),
+        extract_jobs: crate::routes::extract::ExtractJobs::new(),
     });
 
     if cli.cache_ttl > 0 {
@@ -769,9 +822,10 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
 
     let is_multi = state.is_multi_model();
     let mut app = if is_multi {
-        info!("Multi-model mode ({} models)", state.models.len());
-        for m in &state.models {
-            info!("  /v1/{}/...", m.id);
+        let slot_count = state.snapshot_slots().len();
+        info!("Multi-model mode ({} models)", slot_count);
+        for slot in state.snapshot_slots() {
+            info!("  /v1/{}/...", slot.id);
         }
         routes::multi_model_router(Arc::clone(&state))
     } else {
@@ -785,7 +839,8 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
     // the ~1.3 s lazy weight load + ~17 ms / cold layer (see
     // ROADMAP G1 / G2). Same code path as `POST /v1/warmup`.
     if cli.warmup_walk_ffn {
-        for m in &state.models {
+        for m in state.eager_models() {
+            let m = &m;
             let req = routes::warmup::WarmupRequest {
                 layers: None,
                 skip_weights: false,
@@ -805,11 +860,11 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
     }
 
     // Per-(layer, expert) HNSW unit warmup.
-    for m in &state.models {
+    for m in state.eager_models() {
         if m.expert_filter.is_none() && !cli.warmup_walk_ffn {
             continue;
         }
-        let model = Arc::clone(m);
+        let model = Arc::clone(&m);
         let model_id = model.id.clone();
         let t0 = std::time::Instant::now();
         let result = tokio::task::spawn_blocking(move || {
@@ -832,11 +887,11 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
 
     // Metal expert cache warmup (cfg=metal-experts only).
     #[cfg(feature = "metal-experts")]
-    for m in &state.models {
+    for m in state.eager_models() {
         if m.expert_filter.is_none() {
             continue;
         }
-        let model = Arc::clone(m);
+        let model = Arc::clone(&m);
         let model_id = model.id.clone();
         let t0 = std::time::Instant::now();
         let result = tokio::task::spawn_blocking(move || {

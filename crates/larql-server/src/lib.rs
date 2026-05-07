@@ -21,5 +21,6 @@ pub mod openapi;
 pub mod ratelimit;
 pub mod routes;
 pub mod session;
+pub mod slot;
 pub mod state;
 pub mod wire;

@@ -507,6 +507,15 @@ pub mod schemas {
         crate::routes::embed::handle_logits_multi,
         crate::routes::embed::handle_token_encode_multi,
         crate::routes::embed::handle_token_decode_multi,
+        // workspace-level (ported from sibling `larql` repo)
+        crate::routes::lql::handle_lql,
+        crate::routes::hf::handle_hf_search,
+        crate::routes::vindexes::handle_list,
+        crate::routes::vindexes::handle_load,
+        crate::routes::vindexes::handle_unload,
+        crate::routes::vindexes::handle_delete,
+        crate::routes::extract::handle_extract,
+        crate::routes::extract::handle_extract_status,
     ),
     components(schemas(
         ErrorBody,
@@ -568,6 +577,18 @@ pub mod schemas {
         crate::routes::expert::BatchExpertRequest,
         crate::routes::expert::BatchExpertResult,
         crate::routes::expert::BatchExpertResponse,
+        // workspace-level
+        crate::routes::lql::LqlRequest,
+        crate::routes::lql::LqlResponse,
+        crate::routes::hf::HfSearchResponse,
+        crate::routes::hf::HfModelInfo,
+        crate::routes::vindexes::VindexInfo,
+        crate::routes::vindexes::VindexListResponse,
+        crate::routes::vindexes::LoadResponse,
+        crate::routes::vindexes::UnloadResponse,
+        crate::routes::extract::ExtractRequest,
+        crate::routes::extract::ExtractStartResponse,
+        crate::slot::SlotState,
     )),
 )]
 pub struct ApiDoc;
