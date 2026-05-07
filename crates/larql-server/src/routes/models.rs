@@ -63,23 +63,25 @@ pub async fn handle_models(State(state): State<Arc<AppState>>) -> Json<serde_jso
     let multi = state.is_multi_model();
 
     let data: Vec<serde_json::Value> = state
-        .models
+        .snapshot_slots()
         .iter()
-        .map(|m| {
-            let total_features: usize = m.config.layers.iter().map(|l| l.num_features).sum();
+        .map(|slot| {
+            let total_features: usize =
+                slot.config.layers.iter().map(|l| l.num_features).sum();
+            let loaded = slot.loaded_unchecked().is_some();
             serde_json::json!({
-                "id": m.id,
+                "id": slot.id,
                 "object": MODEL_OBJECT,
                 "created": created,
                 "owned_by": OWNED_BY,
                 // larql-specific extras — OpenAI clients ignore these.
                 "path": if multi {
-                    format!("{}/{}", API_PREFIX, m.id)
+                    format!("{}/{}", API_PREFIX, slot.id)
                 } else {
                     API_PREFIX.to_string()
                 },
                 "features": total_features,
-                "loaded": true,
+                "loaded": loaded,
             })
         })
         .collect();

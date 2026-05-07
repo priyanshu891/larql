@@ -4,9 +4,12 @@ pub mod describe;
 pub mod embed;
 pub mod expert;
 pub mod explain;
+pub mod extract;
 pub mod health;
+pub mod hf;
 pub mod infer;
 pub mod insert;
+pub mod lql;
 pub mod models;
 pub mod openai;
 pub mod patches;
@@ -15,6 +18,7 @@ pub mod select;
 pub mod stats;
 pub mod stream;
 pub mod topology;
+pub mod vindexes;
 pub mod walk;
 pub mod walk_ffn;
 pub mod warmup;
@@ -64,6 +68,18 @@ const TOKEN_DECODE: &str = "/v1/token/decode";
 const OPENAI_EMBEDDINGS: &str = "/v1/embeddings";
 const OPENAI_COMPLETIONS: &str = "/v1/completions";
 const OPENAI_CHAT_COMPLETIONS: &str = "/v1/chat/completions";
+
+// Workspace-level endpoints ported from sibling `larql` repo. Shared
+// scope: mounted without a `{model_id}` prefix in both single- and
+// multi-model routers.
+const LQL: &str = "/v1/lql";
+const HF_SEARCH: &str = "/v1/hf/search";
+const VINDEXES: &str = "/v1/vindexes";
+const VINDEX_LOAD: &str = "/v1/vindexes/{name}/load";
+const VINDEX_UNLOAD: &str = "/v1/vindexes/{name}/unload";
+const VINDEX_BY_NAME: &str = "/v1/vindexes/{name}";
+const VINDEX_EXTRACT: &str = "/v1/vindexes/extract";
+const VINDEX_EXTRACT_STATUS: &str = "/v1/vindexes/extract/status";
 
 const M_DESCRIBE: &str = "/v1/{model_id}/describe";
 const M_WALK: &str = "/v1/{model_id}/walk";
@@ -140,6 +156,15 @@ pub fn single_model_router(state: Arc<AppState>) -> Router {
             OPENAI_CHAT_COMPLETIONS,
             post(openai::handle_chat_completions),
         )
+        // Workspace-level endpoints (shared; no model_id prefix).
+        .route(LQL, post(lql::handle_lql))
+        .route(HF_SEARCH, get(hf::handle_hf_search))
+        .route(VINDEXES, get(vindexes::handle_list))
+        .route(VINDEX_LOAD, post(vindexes::handle_load))
+        .route(VINDEX_UNLOAD, post(vindexes::handle_unload))
+        .route(VINDEX_BY_NAME, delete(vindexes::handle_delete))
+        .route(VINDEX_EXTRACT, post(extract::handle_extract))
+        .route(VINDEX_EXTRACT_STATUS, get(extract::handle_extract_status))
         .with_state(state)
 }
 
@@ -172,5 +197,15 @@ pub fn multi_model_router(state: Arc<AppState>) -> Router {
             OPENAI_CHAT_COMPLETIONS,
             post(openai::handle_chat_completions),
         )
+        // Workspace-level endpoints (shared; no model_id prefix — LQL
+        // accepts `?model=<id>` when the server is multi-model).
+        .route(LQL, post(lql::handle_lql))
+        .route(HF_SEARCH, get(hf::handle_hf_search))
+        .route(VINDEXES, get(vindexes::handle_list))
+        .route(VINDEX_LOAD, post(vindexes::handle_load))
+        .route(VINDEX_UNLOAD, post(vindexes::handle_unload))
+        .route(VINDEX_BY_NAME, delete(vindexes::handle_delete))
+        .route(VINDEX_EXTRACT, post(extract::handle_extract))
+        .route(VINDEX_EXTRACT_STATUS, get(extract::handle_extract_status))
         .with_state(state)
 }

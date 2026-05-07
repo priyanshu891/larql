@@ -28,7 +28,7 @@ larql-compute = { path = "../larql-compute" }
 axum = { version = "0.8", features = ["ws"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 tokio = { version = "1", features = ["full"] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["sync"] }
 tonic = "0.13"
 prost = "0.13"
 async-stream = "0.3"
@@ -48,6 +48,12 @@ thiserror = { workspace = true }
 base64 = "0.22"
 utoipa = { version = "5", features = ["axum_extras", "preserve_order"] }
 utoipa-swagger-ui = { version = "9", features = ["axum"] }
+
+# Used by the /v1/hf/search and /v1/vindexes/extract endpoints: HF model
+# search proxy + model-file download bridging progress to SSE.
+reqwest = { version = "0.12", features = ["json"] }
+urlencoding = "2"
+hf-hub = "0.5"
 
 [features]
 default = []

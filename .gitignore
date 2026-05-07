@@ -37,3 +37,4 @@ experiments/
 vindexes/
 .pids/
 docs/replay/
+models/
