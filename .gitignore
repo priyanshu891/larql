@@ -38,3 +38,4 @@ vindexes/
 .pids/
 docs/replay/
 models/*
+.env
