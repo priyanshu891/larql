@@ -280,7 +280,17 @@ impl PatchedVindex {
         residual: &Array1<f32>,
         top_k: usize,
     ) -> Vec<(usize, f32)> {
-        let mut hits = self.base.gate_knn(layer, residual, top_k * 2); // oversample
+        // Clamp to the layer's feature count so callers passing `usize::MAX`
+        // (dense `WalkFfn::top_k_for`) don't overflow the 2× oversample
+        // multiply or OOM the downstream `BinaryHeap::with_capacity`.
+        let num_features = self.base.num_features(layer);
+        if num_features == 0 || top_k == 0 {
+            return Vec::new();
+        }
+        let bounded_top_k = top_k.min(num_features);
+        let oversampled = bounded_top_k.saturating_mul(2).min(num_features);
+
+        let mut hits = self.base.gate_knn(layer, residual, oversampled);
 
         // Apply gate vector overrides
         for (&(l, f), gate_vec) in &self.overrides_gate {
@@ -305,7 +315,7 @@ impl PatchedVindex {
 
         // Re-sort and truncate
         hits.sort_unstable_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap());
-        hits.truncate(top_k);
+        hits.truncate(bounded_top_k);
         hits
     }
 
