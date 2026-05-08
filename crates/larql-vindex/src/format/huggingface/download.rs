@@ -12,6 +12,22 @@ use crate::format::filenames::*;
 use super::publish::get_hf_token;
 use super::{VINDEX_CORE_FILES, VINDEX_WEIGHT_FILES};
 
+/// Build an hf-hub `Api` that respects the `HF_TOKEN` env var.
+///
+/// hf-hub's `Api::new()` only reads the token from `~/.cache/huggingface/token`,
+/// so env-based deployments (Docker, CI) wouldn't authenticate. This wraps
+/// `ApiBuilder::from_env()` (which preserves `HF_HOME` / `HF_ENDPOINT` support)
+/// and layers the token on top.
+fn build_hf_api() -> Result<hf_hub::api::sync::Api, VindexError> {
+    let token = std::env::var("HF_TOKEN")
+        .ok()
+        .filter(|t| !t.trim().is_empty());
+    hf_hub::api::sync::ApiBuilder::from_env()
+        .with_token(token)
+        .build()
+        .map_err(|e| VindexError::Parse(format!("HuggingFace API init failed: {e}")))
+}
+
 /// Resolve an `hf://` path to a local directory, downloading if needed.
 ///
 /// Supports:
@@ -33,8 +49,7 @@ pub fn resolve_hf_vindex(hf_path: &str) -> Result<PathBuf, VindexError> {
     };
 
     // Use hf-hub to download
-    let api = hf_hub::api::sync::Api::new()
-        .map_err(|e| VindexError::Parse(format!("HuggingFace API init failed: {e}")))?;
+    let api = build_hf_api()?;
 
     let repo = if let Some(ref rev) = revision {
         api.repo(hf_hub::Repo::with_revision(
@@ -86,8 +101,7 @@ pub fn download_hf_weights(hf_path: &str) -> Result<(), VindexError> {
         (path.to_string(), None)
     };
 
-    let api = hf_hub::api::sync::Api::new()
-        .map_err(|e| VindexError::Parse(format!("HuggingFace API init failed: {e}")))?;
+    let api = build_hf_api()?;
 
     let repo = if let Some(ref rev) = revision {
         api.repo(hf_hub::Repo::with_revision(
@@ -296,8 +310,7 @@ where
         (path.to_string(), None)
     };
 
-    let api = hf_hub::api::sync::Api::new()
-        .map_err(|e| VindexError::Parse(format!("HuggingFace API init failed: {e}")))?;
+    let api = build_hf_api()?;
 
     let repo = if let Some(ref rev) = revision {
         api.repo(hf_hub::Repo::with_revision(

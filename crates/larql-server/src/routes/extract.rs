@@ -639,7 +639,17 @@ fn download_hf_model(model_id: &str, job: &Arc<ExtractJob>) -> Result<(), String
         total: None,
     });
 
-    let api = hf_hub::api::sync::Api::new().map_err(|e| format!("hf api init: {e}"))?;
+    // hf-hub's default `Api::new()` only reads the token from
+    // ~/.cache/huggingface/token, ignoring HF_TOKEN. Wire the env var through
+    // explicitly so `HF_TOKEN=…` (as documented for docker compose) works
+    // for gated-model extracts. Empty string is treated as unset.
+    let hf_token = std::env::var("HF_TOKEN")
+        .ok()
+        .filter(|t| !t.trim().is_empty());
+    let api = hf_hub::api::sync::ApiBuilder::from_env()
+        .with_token(hf_token)
+        .build()
+        .map_err(|e| format!("hf api init: {e}"))?;
     let repo = api.model(model_id.to_string());
 
     let cache = hf_hub::Cache::from_env();

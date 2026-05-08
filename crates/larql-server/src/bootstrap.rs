@@ -607,8 +607,10 @@ pub struct Cli {
     /// Workspace directory containing vindex subfolders. Discovered but
     /// unloaded vindexes are surfaced via `GET /v1/vindexes`; extracts
     /// land here. CLI flag takes precedence over the `LARQL_VINDEX_DIR`
-    /// env var.
-    #[arg(long, value_name = "PATH", env = "LARQL_VINDEX_DIR")]
+    /// env var, which takes precedence over the default `./models`
+    /// (CWD-relative). If the resolved path doesn't exist, the server
+    /// boots empty rather than erroring.
+    #[arg(long, value_name = "PATH", env = "LARQL_VINDEX_DIR", default_value = "./models")]
     pub vindex_dir: Option<PathBuf>,
 }
 
@@ -736,13 +738,9 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
     } else if let Some(ref vindex_path) = cli.vindex_path {
         let m = load_single_vindex(vindex_path, load_opts)?;
         models.push(Arc::new(m));
-    } else {
-        return Err("must provide a vindex path or --dir".into());
     }
-
-    if models.is_empty() {
-        return Err("no vindexes loaded".into());
-    }
+    // else: no eager loads. Server boots empty; the UI (or a
+    // `POST /v1/vindexes/{id}/load`) promotes Discovered slots on demand.
 
     let rate_limiter =
         cli.rate_limit
@@ -820,12 +818,23 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
         info!("DESCRIBE cache: {}s TTL", cli.cache_ttl);
     }
 
-    let is_multi = state.is_multi_model();
+    // Force multi-model router when nothing was eagerly loaded, so the
+    // `/v1/vindexes/*` endpoints the UI drives are always present.
+    // Indexing `&models[0]` below is only safe because the single-model
+    // branch is now gated on `!models.is_empty()`.
+    let is_multi = state.is_multi_model() || models.is_empty();
     let mut app = if is_multi {
         let slot_count = state.snapshot_slots().len();
-        info!("Multi-model mode ({} models)", slot_count);
-        for slot in state.snapshot_slots() {
-            info!("  /v1/{}/...", slot.id);
+        if slot_count == 0 {
+            info!(
+                "Multi-model mode (no vindexes loaded — set LARQL_VINDEX_DIR or \
+                 POST /v1/vindexes/{{id}}/load to begin)"
+            );
+        } else {
+            info!("Multi-model mode ({} models)", slot_count);
+            for slot in state.snapshot_slots() {
+                info!("  /v1/{}/...", slot.id);
+            }
         }
         routes::multi_model_router(Arc::clone(&state))
     } else {

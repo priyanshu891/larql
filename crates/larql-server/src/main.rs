@@ -12,6 +12,10 @@ use larql_server::bootstrap::{self, normalize_serve_alias, BoxError, Cli};
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
+    // Load .env from CWD (and walk up) before clap reads env-backed args.
+    // Silently no-ops when no file is found — presence is optional.
+    let _ = dotenvy::dotenv();
+
     // Accept both `larql-server <path>` and `larql-server serve <path>`.
     let cli = Cli::parse_from(normalize_serve_alias(std::env::args().collect()));
 
