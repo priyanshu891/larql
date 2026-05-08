@@ -140,7 +140,6 @@ pub(crate) fn validate_architecture<A: ModelArchitecture + ?Sized>(
     );
     validate_optional_positive_f64(&mut errors, FIELD_LOGITS_SCALING, cfg.logits_scaling);
 
-    validate_hidden_head_dim(cfg, &mut errors);
     validate_attention_heads(
         &mut errors,
         FIELD_NUM_Q_HEADS,
@@ -223,18 +222,6 @@ fn validate_optional_positive_f64(
 fn validate_fraction(errors: &mut Vec<ConfigValidationError>, field: &'static str, value: f64) {
     if !value.is_finite() || value <= 0.0 || value > 1.0 {
         errors.push(ConfigValidationError::new(field, MESSAGE_MUST_BE_FRACTION));
-    }
-}
-
-fn validate_hidden_head_dim(cfg: &ModelConfig, errors: &mut Vec<ConfigValidationError>) {
-    if cfg.hidden_size > 0 && cfg.head_dim > 0 && !cfg.hidden_size.is_multiple_of(cfg.head_dim) {
-        errors.push(ConfigValidationError::new(
-            FIELD_HEAD_DIM,
-            format!(
-                "head_dim {} must divide hidden_size {}",
-                cfg.head_dim, cfg.hidden_size
-            ),
-        ));
     }
 }
 
@@ -379,7 +366,7 @@ fn validate_per_layer_overrides<A: ModelArchitecture + ?Sized>(
     }
 
     for layer in 0..cfg.num_layers {
-        if !validate_one_layer(arch, cfg, layer, errors) {
+        if !validate_one_layer(arch, layer, errors) {
             break;
         }
     }
@@ -387,7 +374,6 @@ fn validate_per_layer_overrides<A: ModelArchitecture + ?Sized>(
 
 fn validate_one_layer<A: ModelArchitecture + ?Sized>(
     arch: &A,
-    cfg: &ModelConfig,
     layer: usize,
     errors: &mut Vec<ConfigValidationError>,
 ) -> bool {
@@ -401,16 +387,6 @@ fn validate_one_layer<A: ModelArchitecture + ?Sized>(
         errors.push(ConfigValidationError::new(
             FIELD_HEAD_DIM_FOR_LAYER,
             format!("layer {layer} returned 0"),
-        ));
-        return false;
-    }
-    if cfg.hidden_size > 0 && !cfg.hidden_size.is_multiple_of(head_dim) {
-        errors.push(ConfigValidationError::new(
-            FIELD_HEAD_DIM_FOR_LAYER,
-            format!(
-                "layer {layer} head_dim {head_dim} must divide hidden_size {}",
-                cfg.hidden_size
-            ),
         ));
         return false;
     }

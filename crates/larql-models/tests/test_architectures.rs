@@ -386,7 +386,9 @@ fn validation_rejects_invalid_attention_geometry() {
     }));
     let fields = validation_fields(arch.as_ref());
 
-    assert!(fields.contains(&FIELD_HEAD_DIM));
+    // num_attention_heads (10) must be divisible by num_key_value_heads (3).
+    // head_dim does not need to divide hidden_size — Q/K/V projections are
+    // non-square in Gemma 3 and other modern architectures.
     assert!(fields.contains(&FIELD_NUM_Q_HEADS));
 }
 
