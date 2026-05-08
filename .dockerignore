@@ -6,4 +6,11 @@ knowledge/
 experiments/
 docs/
 *.vindex
+models/
 /tmp/
+.env
+.env.*
+Dockerfile
+docker-compose.yml
+.dockerignore
+**/.DS_Store
