@@ -257,7 +257,7 @@ fn main() {
         })
         .collect();
     let mut files = files;
-    files.sort_by(|a, b| b.1.cmp(&a.1));
+    files.sort_by_key(|(_, size)| std::cmp::Reverse(*size));
     println!("  Files:");
     for (name, size) in &files {
         if *size > 1024 {
@@ -785,6 +785,7 @@ fn make_synthetic_model() -> larql_models::ModelWeights {
         packed_byte_ranges: std::collections::HashMap::new(),
         embed: embed.clone(),
         lm_head: embed.clone(),
+        position_embed: None,
         num_layers,
         hidden_size: hidden,
         intermediate_size: intermediate,

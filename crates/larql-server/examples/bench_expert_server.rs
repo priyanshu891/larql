@@ -32,9 +32,9 @@ use std::time::{Duration, Instant};
 
 use tokio::net::TcpListener;
 
-use larql_inference::{
-    cpu_moe_forward, MoeLayerWeights, MoeRouterWeights, RemoteMoeBackend, ShardConfig,
-};
+use larql_compute::cpu::ops::moe::cpu_moe_forward;
+use larql_compute::MoeLayerWeights;
+use larql_inference::{MoeRouterWeights, RemoteMoeBackend, ShardConfig};
 use larql_server::{
     bootstrap::{load_single_vindex, LoadVindexOptions},
     cache::DescribeCache,
@@ -419,8 +419,12 @@ fn main() {
         let no = arch.norm_weight_offset();
         let ep = arch.norm_eps();
 
-        let layer_rs: Vec<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> = (0
-            ..num_layers)
+        // Six owned f32 vectors per layer: input/post-attn/pre-FFN/post-FFN
+        // norms plus QK-norm weights. `type` alias keeps the clippy
+        // `type_complexity` lint happy.
+        type LayerNorms = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
+
+        let layer_rs: Vec<LayerNorms> = (0..num_layers)
             .map(|l| {
                 (
                     arch.moe_router_key(l)
@@ -589,6 +593,8 @@ fn main() {
     let layer_w = MoeLayerWeights {
         experts_gate_up: experts_gate_up_local,
         experts_down: experts_down_local,
+        routing_policy: larql_compute::MoeRoutingPolicy::gemma4_hybrid(),
+        weight_layout: larql_compute::MoeWeightLayout::default(),
         router_proj: &router_proj,
         router_scale: &router_scale,
         router_per_expert_scale: &router_per_expert_scale,

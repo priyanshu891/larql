@@ -1,7 +1,9 @@
 //! Tests for the larql-vindex crate.
 
 use larql_vindex::format::filenames::*;
-use larql_vindex::{FeatureMeta, GateIndex, VectorIndex, VindexConfig, VindexLayerInfo};
+use larql_vindex::{
+    FeatureMeta, GateIndex, PatchOverrides, VectorIndex, VindexConfig, VindexLayerInfo,
+};
 use ndarray::{ArcArray2, Array1, Array2};
 
 fn make_top_k(token: &str, id: u32, logit: f32) -> larql_models::TopKEntry {
@@ -283,7 +285,6 @@ fn down_overrides_starts_empty() {
 
 #[test]
 fn set_down_vector_records_override() {
-    use larql_vindex::GateIndex;
     let mut idx = test_index();
     let v = vec![0.1, 0.2, 0.3, 0.4];
     idx.set_down_vector(0, 1, v.clone());
@@ -1915,6 +1916,7 @@ fn make_synthetic_model() -> larql_models::ModelWeights {
         packed_byte_ranges: std::collections::HashMap::new(),
         embed,
         lm_head,
+        position_embed: None,
         num_layers,
         hidden_size: hidden,
         intermediate_size: intermediate,
@@ -2559,7 +2561,7 @@ fn streaming_extract_from_safetensors() {
             )
         })
         .collect();
-    let serialized = safetensors::tensor::serialize(views, &None).unwrap();
+    let serialized = safetensors::tensor::serialize(views, None).unwrap();
     std::fs::write(model_dir.join("model.safetensors"), &serialized).unwrap();
 
     // Write tokenizer
@@ -2763,7 +2765,7 @@ fn streaming_extract_q4k_from_safetensors() {
             )
         })
         .collect();
-    let serialized = safetensors::tensor::serialize(views, &None).unwrap();
+    let serialized = safetensors::tensor::serialize(views, None).unwrap();
     std::fs::write(model_dir.join("model.safetensors"), &serialized).unwrap();
 
     let tok_json =
@@ -3727,7 +3729,7 @@ fn streaming_extract_q4k_carries_ple_tensors() {
             )
         })
         .collect();
-    let serialized = safetensors::tensor::serialize(views, &None).unwrap();
+    let serialized = safetensors::tensor::serialize(views, None).unwrap();
     std::fs::write(model_dir.join("model.safetensors"), &serialized).unwrap();
 
     let tok_json =
@@ -4016,7 +4018,7 @@ fn streaming_extract_preserves_per_layer_intermediate_for_variable_ffn() {
             )
         })
         .collect();
-    let serialized = safetensors::tensor::serialize(views, &None).unwrap();
+    let serialized = safetensors::tensor::serialize(views, None).unwrap();
     std::fs::write(model_dir.join("model.safetensors"), &serialized).unwrap();
 
     let tok_json =

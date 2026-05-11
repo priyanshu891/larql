@@ -16,14 +16,14 @@
 
 use clap::Args;
 
+#[cfg(all(feature = "metal", target_os = "macos"))]
+use crate::commands::primary::cache;
 use larql_compute::cpu::ops::moe::{cpu_moe_forward, run_single_expert_with_norm};
 use larql_compute::cpu::ops::q4_common::dequantize_q4_k;
-use larql_compute::{Activation, MoeLayerWeights, QuantFormat};
+use larql_compute::{Activation, MoeLayerWeights, MoeRoutingPolicy, MoeWeightLayout, QuantFormat};
 use larql_models::weights::{per_layer_ffn_key, PER_LAYER_FFN_DOWN, PER_LAYER_FFN_GATE_UP};
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use larql_vindex::{load_model_weights_q4k, load_vindex_config, SilentLoadCallbacks};
-#[cfg(all(feature = "metal", target_os = "macos"))]
-use crate::commands::primary::cache;
 
 // ── Component / backend taxonomies ────────────────────────────────────────────
 
@@ -235,7 +235,7 @@ fn run_lm_head(
 
     let mut traces: Vec<(&str, Vec<f32>)> = vec![("reference (f32 dot)", ref_scores.clone())];
 
-    if backends.iter().any(|b| *b == "cpu") {
+    if backends.contains(&"cpu") {
         let hits = index.lm_head_knn_backend(&h1d, vocab.min(8), &cpu);
         if !hits.is_empty() {
             // hits is (token, score) sorted descending. Reconstruct a
@@ -404,6 +404,11 @@ fn run_moe_block(
     let moe = MoeLayerWeights {
         experts_gate_up: experts_gate_up.clone(),
         experts_down: experts_down.clone(),
+        routing_policy: match arch.moe_router_type() {
+            "gemma4_top_k_softmax" => MoeRoutingPolicy::gemma4_hybrid(),
+            _ => MoeRoutingPolicy::top_k_softmax(),
+        },
+        weight_layout: MoeWeightLayout::default(),
         expert_data_format: QuantFormat::Q4_K,
         router_proj: &router_proj,
         router_scale: &[],
@@ -1118,7 +1123,9 @@ fn naive_top_k(logits: &[f32], k: usize) -> (Vec<usize>, Vec<f32>) {
 }
 
 fn naive_gelu_tanh(x: f32) -> f32 {
-    let c = 0.7978845608_f32;
+    // sqrt(2 / π); precision capped at f32 range — the tanh approx
+    // already saturates well before more digits would matter.
+    let c = 0.797_884_6_f32;
     0.5 * x * (1.0 + (c * (x + 0.044715 * x * x * x)).tanh())
 }
 
@@ -1128,11 +1135,11 @@ fn naive_silu(x: f32) -> f32 {
 
 // ── Vindex helpers ────────────────────────────────────────────────────────────
 
-fn expert_bytes<'a>(
-    weights: &'a larql_models::ModelWeights,
+fn expert_bytes(
+    weights: &larql_models::ModelWeights,
     layer: usize,
     expert: usize,
-) -> Result<(&'a [u8], &'a [u8]), Box<dyn std::error::Error>> {
+) -> Result<(&[u8], &[u8]), Box<dyn std::error::Error>> {
     let gu_key = per_layer_ffn_key(layer, expert, PER_LAYER_FFN_GATE_UP);
     let dn_key = per_layer_ffn_key(layer, expert, PER_LAYER_FFN_DOWN);
     let gu = weights
@@ -1144,7 +1151,7 @@ fn expert_bytes<'a>(
     Ok((gu, dn))
 }
 
-fn pre_experts_norm_for<'a>(weights: &'a larql_models::ModelWeights, layer: usize) -> &'a [f32] {
+fn pre_experts_norm_for(weights: &larql_models::ModelWeights, layer: usize) -> &[f32] {
     weights
         .arch
         .moe_pre_experts_norm_key(layer)
@@ -1153,7 +1160,7 @@ fn pre_experts_norm_for<'a>(weights: &'a larql_models::ModelWeights, layer: usiz
         .unwrap_or(&[])
 }
 
-fn post_experts_norm_for<'a>(weights: &'a larql_models::ModelWeights, layer: usize) -> &'a [f32] {
+fn post_experts_norm_for(weights: &larql_models::ModelWeights, layer: usize) -> &[f32] {
     weights
         .arch
         .moe_post_experts_norm_key(layer)

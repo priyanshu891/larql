@@ -11,9 +11,11 @@ use std::time::Instant;
 use clap::Args;
 
 use larql_inference::{
-    calibrate_scalar_gains, predict, predict_with_ffn, predict_with_strategy,
+    calibrate_scalar_gains, predict,
+    predict::LayerMode,
+    predict_with_ffn, predict_with_strategy,
     vindex::{WalkFfn, WalkFfnConfig},
-    FfnBackend, InferenceModel, LayerMode, WeightFfn,
+    FfnBackend, InferenceModel, WeightFfn,
 };
 use larql_vindex::{SilentLoadCallbacks, VectorIndex};
 
