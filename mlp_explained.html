@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>The MLP in Transformers — Visual Guide</title>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    max-width: 900px;
+    margin: 40px auto;
+    padding: 20px;
+    background: #fafaf7;
+    color: #222;
+    line-height: 1.6;
+  }
+  h1 { color: #2a4d8f; }
+  h2 { color: #2a4d8f; margin-top: 40px; border-bottom: 2px solid #e0d8c8; padding-bottom: 6px; }
+  .diagram {
+    background: white;
+    border: 1px solid #d8d2c4;
+    border-radius: 12px;
+    padding: 30px;
+    margin: 20px 0;
+    text-align: center;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.04);
+  }
+  .box {
+    display: inline-block;
+    padding: 14px 18px;
+    border-radius: 10px;
+    margin: 8px;
+    font-weight: 600;
+    color: white;
+    min-width: 120px;
+  }
+  .input { background: #5b9aa0; }
+  .expand { background: #d68c45; }
+  .bend { background: #b85450; }
+  .shrink { background: #6a994e; }
+  .arrow {
+    font-size: 28px;
+    color: #888;
+    margin: 0 4px;
+    vertical-align: middle;
+  }
+  .note {
+    background: #fff8e1;
+    border-left: 4px solid #f0b840;
+    padding: 12px 16px;
+    margin: 16px 0;
+    border-radius: 4px;
+  }
+  .analogy {
+    background: #eaf4f0;
+    border-left: 4px solid #6a994e;
+    padding: 12px 16px;
+    margin: 16px 0;
+    border-radius: 4px;
+  }
+  svg { max-width: 100%; height: auto; }
+  table { width: 100%; border-collapse: collapse; margin: 16px 0; }
+  th, td { padding: 10px; text-align: left; border-bottom: 1px solid #e0d8c8; }
+  th { background: #2a4d8f; color: white; }
+  code { background: #f0ebe0; padding: 2px 6px; border-radius: 4px; font-size: 0.95em; }
+</style>
+</head>
+<body>
+
+<h1>The MLP in Transformers — Visual Guide</h1>
+<p><em>For a curious 15-year-old who already gets the big picture.</em></p>
+
+<h2>1. The Flow at a Glance</h2>
+
+<div class="diagram">
+  <div class="box input">Word vector<br><small>512 numbers</small></div>
+  <span class="arrow">→</span>
+  <div class="box expand">Expand (W₁)<br><small>to 2048</small></div>
+  <span class="arrow">→</span>
+  <div class="box bend">Bend (GELU)<br><small>still 2048</small></div>
+  <span class="arrow">→</span>
+  <div class="box shrink">Shrink (W₂)<br><small>back to 512</small></div>
+  <p style="margin-top: 24px; color: #555;">One word in, the same word (transformed) out. Same recipe runs on every word in parallel.</p>
+</div>
+
+<h2>2. What Does "Bending" Look Like? (GELU vs ReLU)</h2>
+
+<p>The activation function is the part that lets the MLP make <em>decisions</em>. Without it, the whole thing collapses into boring multiplication. Here's what the two most common bending functions actually do:</p>
+
+<div class="diagram">
+<svg viewBox="0 0 600 280" xmlns="http://www.w3.org/2000/svg">
+  <!-- axes -->
+  <line x1="50" y1="240" x2="280" y2="240" stroke="#888" stroke-width="1.5"/>
+  <line x1="165" y1="20" x2="165" y2="260" stroke="#888" stroke-width="1.5"/>
+  <text x="280" y="255" font-size="11" fill="#666">x</text>
+  <text x="170" y="20" font-size="11" fill="#666">y</text>
+  <text x="100" y="15" font-size="14" font-weight="bold" fill="#b85450">ReLU</text>
+
+  <!-- ReLU: y = max(0, x) -->
+  <line x1="50" y1="240" x2="165" y2="240" stroke="#b85450" stroke-width="3"/>
+  <line x1="165" y1="240" x2="280" y2="20" stroke="#b85450" stroke-width="3"/>
+
+  <!-- second axes -->
+  <line x1="320" y1="240" x2="560" y2="240" stroke="#888" stroke-width="1.5"/>
+  <line x1="440" y1="20" x2="440" y2="260" stroke="#888" stroke-width="1.5"/>
+  <text x="560" y="255" font-size="11" fill="#666">x</text>
+  <text x="445" y="20" font-size="11" fill="#666">y</text>
+  <text x="370" y="15" font-size="14" font-weight="bold" fill="#d68c45">GELU</text>
+
+  <!-- GELU smooth curve approximation -->
+  <path d="M 320,242 Q 380,244 420,238 Q 440,232 460,205 Q 490,150 520,80 Q 540,40 560,20"
+        stroke="#d68c45" stroke-width="3" fill="none"/>
+</svg>
+
+<p style="text-align: left;"><strong>ReLU</strong> is like a strict bouncer: "Negative number? OUT (zero). Positive? Come on in." Sharp corner at zero.</p>
+<p style="text-align: left;"><strong>GELU</strong> is the same idea but smoother — it lets a tiny bit of slightly-negative stuff through, like a friendlier bouncer. The smoothness helps training go better, which is why modern transformers (GPT, BERT) prefer it.</p>
+</div>
+
+<div class="note">
+<strong>Why does bending matter?</strong> If you only stack matrix multiplications (no bending), you can prove mathematically that 100 layers do the same thing as 1 layer. The bend is what gives the network the power to learn anything interesting. It's the "decision-making" step.
+</div>
+
+<h2>3. Why Expand to 4× Bigger?</h2>
+
+<p>Think of it like this: imagine you have a <strong>compressed zip file</strong> of all your school notes — small, tight, dense. To actually read and edit your notes, you have to <strong>unzip</strong> them first. That's what the expansion does.</p>
+
+<div class="analogy">
+<strong>The locker analogy.</strong> Your word vector (512 numbers) is like a tightly packed school locker. Everything's crammed in. The MLP says: "Let me dump it all out on a giant table (2048 spots)" — now there's space to sort, label, and decide what matters. Then it picks the important stuff and puts it back in the locker (512 again).
+</div>
+
+<p>Why <em>specifically</em> 4×? Honestly, it's mostly experimental — researchers tried different sizes and 4× turned out to be a sweet spot between:</p>
+
+<table>
+<tr><th>Smaller (e.g., 2×)</th><th>4× (the standard)</th><th>Larger (e.g., 8×)</th></tr>
+<tr><td>Fast & cheap, but the model can't store as many patterns</td><td>Enough room to store lots of facts, training is stable, GPU memory manageable</td><td>More capacity, but training gets slower and harder, often not worth it</td></tr>
+</table>
+
+<h2>4. The MLP as a "Memory Bank"</h2>
+
+<p>Here's the most interesting research finding from the last few years: those big weight matrices inside the MLP behave like a <strong>key-value lookup table</strong>.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 600 200" xmlns="http://www.w3.org/2000/svg">
+  <rect x="20" y="60" width="120" height="80" rx="10" fill="#5b9aa0"/>
+  <text x="80" y="95" text-anchor="middle" fill="white" font-size="13" font-weight="bold">Word: "Paris"</text>
+  <text x="80" y="115" text-anchor="middle" fill="white" font-size="11">vector in</text>
+
+  <text x="170" y="105" font-size="24" fill="#888">→</text>
+
+  <rect x="200" y="40" width="200" height="120" rx="10" fill="#fff" stroke="#d68c45" stroke-width="2"/>
+  <text x="300" y="60" text-anchor="middle" font-size="12" font-weight="bold" fill="#d68c45">MLP "memory"</text>
+  <text x="300" y="85" text-anchor="middle" font-size="11" fill="#444">🔑 capital cities → 🔥</text>
+  <text x="300" y="105" text-anchor="middle" font-size="11" fill="#bbb">🔑 fruits → ❄️</text>
+  <text x="300" y="125" text-anchor="middle" font-size="11" fill="#444">🔑 European places → 🔥</text>
+  <text x="300" y="145" text-anchor="middle" font-size="11" fill="#bbb">🔑 sports teams → ❄️</text>
+
+  <text x="430" y="105" font-size="24" fill="#888">→</text>
+
+  <rect x="460" y="60" width="120" height="80" rx="10" fill="#6a994e"/>
+  <text x="520" y="95" text-anchor="middle" fill="white" font-size="13" font-weight="bold">Enriched</text>
+  <text x="520" y="115" text-anchor="middle" fill="white" font-size="11">"Paris" vector</text>
+</svg>
+</div>
+
+<p>The expand step (<code>W₁</code>) acts like a giant set of <strong>questions</strong>: "Is this a capital city? Is this a fruit? Is this a verb?" Each of the 2048 neurons is asking one such question. The bending step (GELU) keeps only the questions that got a strong "yes." The shrink step (<code>W₂</code>) then mixes the answers back into a normal-sized vector full of relevant knowledge.</p>
+
+<h2>5. Putting It All Together</h2>
+
+<div class="analogy">
+<strong>Final analogy:</strong> A transformer block is like one round of class.
+<ul>
+  <li><strong>Attention</strong> = students discussing — sharing what they each understand.</li>
+  <li><strong>MLP</strong> = each student opening their own textbook to look things up and think privately.</li>
+</ul>
+Stack many rounds (12, 96, sometimes more) and the model gets really smart.
+</div>
+
+<h2>6. Cheat Sheet</h2>
+
+<table>
+<tr><th>Term</th><th>What it means</th></tr>
+<tr><td>MLP / FFN</td><td>The "thinking" block after attention</td></tr>
+<tr><td>W₁</td><td>The "expand" matrix (512 → 2048)</td></tr>
+<tr><td>GELU / ReLU</td><td>The "bending" function — adds decision-making power</td></tr>
+<tr><td>W₂</td><td>The "shrink" matrix (2048 → 512)</td></tr>
+<tr><td>Position-wise</td><td>Same MLP runs on each word separately</td></tr>
+<tr><td>4× hidden size</td><td>The standard expansion ratio — sweet spot from experiments</td></tr>
+</table>
+
+<h2>7. Residual Connections — the Shortcut Arrows</h2>
+
+<p>Imagine playing telephone with 50 people in a line — the message gets garbled. But what if each person also kept a sticky note of the <strong>original</strong> message and added it back at every step? The message would survive. That's a residual connection.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 600 220" xmlns="http://www.w3.org/2000/svg">
+  <!-- input -->
+  <rect x="20" y="90" width="80" height="40" rx="8" fill="#5b9aa0"/>
+  <text x="60" y="115" text-anchor="middle" fill="white" font-size="13" font-weight="bold">x</text>
+
+  <!-- arrow into block -->
+  <line x1="100" y1="110" x2="180" y2="110" stroke="#444" stroke-width="2" marker-end="url(#arr)"/>
+
+  <!-- block -->
+  <rect x="180" y="80" width="160" height="60" rx="10" fill="#d68c45"/>
+  <text x="260" y="115" text-anchor="middle" fill="white" font-size="13" font-weight="bold">Attention or MLP</text>
+
+  <!-- arrow out -->
+  <line x1="340" y1="110" x2="420" y2="110" stroke="#444" stroke-width="2" marker-end="url(#arr)"/>
+
+  <!-- plus sign -->
+  <circle cx="440" cy="110" r="20" fill="#fff" stroke="#444" stroke-width="2"/>
+  <text x="440" y="117" text-anchor="middle" font-size="22" font-weight="bold" fill="#444">+</text>
+
+  <!-- output -->
+  <line x1="460" y1="110" x2="520" y2="110" stroke="#444" stroke-width="2" marker-end="url(#arr)"/>
+  <rect x="520" y="90" width="60" height="40" rx="8" fill="#6a994e"/>
+  <text x="550" y="115" text-anchor="middle" fill="white" font-size="13" font-weight="bold">out</text>
+
+  <!-- residual shortcut -->
+  <path d="M 60,90 Q 60,30 440,30 Q 440,75 440,88" stroke="#b85450" stroke-width="2.5" fill="none" stroke-dasharray="6,4" marker-end="url(#arr2)"/>
+  <text x="250" y="22" font-size="12" fill="#b85450" font-weight="bold">residual shortcut: copy x straight to the +</text>
+
+  <defs>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#444"/>
+    </marker>
+    <marker id="arr2" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#b85450"/>
+    </marker>
+  </defs>
+</svg>
+<p style="text-align: left; margin-top: 16px;"><code>output = x + Block(x)</code> — the original input is <strong>added back</strong> after the block.</p>
+</div>
+
+<div class="note">
+<strong>Why this matters:</strong> Without residuals, you can't train deep networks at all — the signal gets lost. With them, you can stack 96+ layers and training works fine. This single idea (from a 2015 paper called ResNet) made modern deep learning possible.
+</div>
+
+<h2>8. Layer Normalization — the Leveling Step</h2>
+
+<p>As numbers flow through layers, they tend to either explode or shrink to zero. Layer Norm fixes this by putting each vector on a "standard scale."</p>
+
+<div class="analogy">
+<strong>Grading analogy:</strong> School A grades out of 10, School B grades out of 100. To compare students fairly, you'd convert everyone's scores to percentiles. Layer Norm does the same thing — for each word vector, it centers the numbers around 0 and rescales them to a normal range, so the next layer always sees something predictable.
+</div>
+
+<p>The math is simple: subtract the average, divide by the spread. Then two tiny learnable knobs (γ and β) let the model rescale if it wants. That's it.</p>
+
+<h2>9. The Full Transformer Block</h2>
+
+<p>Now let's put <strong>everything</strong> together. This is what one block actually looks like (using the modern "Pre-Norm" style — what GPT and LLaMA use):</p>
+
+<div class="diagram">
+<svg viewBox="0 0 500 480" xmlns="http://www.w3.org/2000/svg">
+  <!-- input -->
+  <rect x="200" y="10" width="100" height="35" rx="8" fill="#5b9aa0"/>
+  <text x="250" y="33" text-anchor="middle" fill="white" font-size="13" font-weight="bold">input x</text>
+  <line x1="250" y1="45" x2="250" y2="70" stroke="#444" stroke-width="2"/>
+
+  <!-- LN1 -->
+  <rect x="200" y="70" width="100" height="32" rx="8" fill="#9b6b9e"/>
+  <text x="250" y="91" text-anchor="middle" fill="white" font-size="12" font-weight="bold">LayerNorm</text>
+  <line x1="250" y1="102" x2="250" y2="120" stroke="#444" stroke-width="2"/>
+
+  <!-- Attention -->
+  <rect x="180" y="120" width="140" height="40" rx="10" fill="#d68c45"/>
+  <text x="250" y="145" text-anchor="middle" fill="white" font-size="13" font-weight="bold">Attention</text>
+  <line x1="250" y1="160" x2="250" y2="185" stroke="#444" stroke-width="2"/>
+
+  <!-- + 1 -->
+  <circle cx="250" cy="200" r="16" fill="#fff" stroke="#444" stroke-width="2"/>
+  <text x="250" y="207" text-anchor="middle" font-size="20" font-weight="bold" fill="#444">+</text>
+
+  <!-- residual 1 -->
+  <path d="M 250,28 Q 100,28 100,200 Q 100,200 232,200" stroke="#b85450" stroke-width="2" fill="none" stroke-dasharray="5,3"/>
+  <text x="50" y="120" font-size="11" fill="#b85450" font-weight="bold">residual</text>
+
+  <line x1="250" y1="216" x2="250" y2="240" stroke="#444" stroke-width="2"/>
+
+  <!-- LN2 -->
+  <rect x="200" y="240" width="100" height="32" rx="8" fill="#9b6b9e"/>
+  <text x="250" y="261" text-anchor="middle" fill="white" font-size="12" font-weight="bold">LayerNorm</text>
+  <line x1="250" y1="272" x2="250" y2="290" stroke="#444" stroke-width="2"/>
+
+  <!-- MLP -->
+  <rect x="180" y="290" width="140" height="40" rx="10" fill="#6a994e"/>
+  <text x="250" y="315" text-anchor="middle" fill="white" font-size="13" font-weight="bold">MLP (FFN)</text>
+  <line x1="250" y1="330" x2="250" y2="355" stroke="#444" stroke-width="2"/>
+
+  <!-- + 2 -->
+  <circle cx="250" cy="370" r="16" fill="#fff" stroke="#444" stroke-width="2"/>
+  <text x="250" y="377" text-anchor="middle" font-size="20" font-weight="bold" fill="#444">+</text>
+
+  <!-- residual 2 -->
+  <path d="M 250,216 Q 400,216 400,370 Q 400,370 268,370" stroke="#b85450" stroke-width="2" fill="none" stroke-dasharray="5,3"/>
+  <text x="410" y="290" font-size="11" fill="#b85450" font-weight="bold">residual</text>
+
+  <line x1="250" y1="386" x2="250" y2="410" stroke="#444" stroke-width="2"/>
+
+  <!-- output -->
+  <rect x="190" y="410" width="120" height="40" rx="8" fill="#2a4d8f"/>
+  <text x="250" y="435" text-anchor="middle" fill="white" font-size="13" font-weight="bold">to next block →</text>
+</svg>
+</div>
+
+<p>Read it top to bottom:</p>
+<ol>
+  <li>Input <code>x</code> comes in.</li>
+  <li>Normalize it (LayerNorm).</li>
+  <li>Run Attention — words share info.</li>
+  <li>Add original <code>x</code> back (first residual).</li>
+  <li>Normalize again.</li>
+  <li>Run the MLP — each word thinks privately.</li>
+  <li>Add the post-attention vector back (second residual).</li>
+  <li>Pass to the next block.</li>
+</ol>
+
+<div class="note">
+<strong>Stacking blocks:</strong> Repeat this exact block 12 times for a small model, 96 times for GPT-3, or even more for the biggest models today. Each block is identical in shape — just with its own learned weights.
+</div>
+
+<h2>10. The Whole Picture</h2>
+
+<div class="analogy">
+A transformer is a <strong>tower</strong> of identical blocks. In each block: words first chat with each other (Attention), then each word goes home to study privately (MLP). Layer Norm keeps the numbers tidy. Residual connections keep the original message alive all the way through. Stack 'em high, train on enormous text, and you've got something that can write essays, code, and poetry.
+</div>
+
+<p style="margin-top: 40px; color: #888; font-size: 0.9em; text-align: center;">
+That's it — you now know the full anatomy of a transformer block.
+</p>
+
+</body>
+</html>

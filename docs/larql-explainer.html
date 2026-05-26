@@ -1,0 +1,836 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>LARQL Explainer</title>
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #fafaff;
+    --panel: #ffffff;
+    --ink: #1a1a2e;
+    --muted: #6b7280;
+    --line: #e5e7eb;
+    --residual: #93c5fd;
+    --residual-deep: #3b82f6;
+    --attn: #cbd5e1;
+    --attn-ink: #94a3b8;
+    --gate: #c4b5fd;
+    --gate-deep: #7c3aed;
+    --fire: #f472b6;
+    --fire-deep: #db2777;
+    --down: #a7f3d0;
+    --down-deep: #059669;
+    --probs: #fde68a;
+    --probs-deep: #d97706;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--ink);
+    font-size: 14px;
+  }
+  header {
+    border-bottom: 1px solid var(--line);
+    background: var(--panel);
+    padding: 14px 24px;
+    display: flex;
+    align-items: center;
+    gap: 24px;
+    flex-wrap: wrap;
+  }
+  h1 {
+    font-size: 18px;
+    margin: 0;
+    color: var(--gate-deep);
+    letter-spacing: -0.01em;
+    font-weight: 700;
+  }
+  h1 .sub {
+    color: var(--muted);
+    font-weight: 500;
+    font-size: 13px;
+    margin-left: 6px;
+  }
+  .prompt-bar {
+    flex: 1;
+    min-width: 320px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: #f3f4ff;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 6px 10px;
+  }
+  .prompt-bar input {
+    flex: 1;
+    background: transparent;
+    border: none;
+    outline: none;
+    font-size: 14px;
+    color: var(--ink);
+  }
+  .prompt-bar .next {
+    color: var(--gate-deep);
+    font-weight: 600;
+  }
+  button {
+    background: var(--gate-deep);
+    color: white;
+    border: none;
+    border-radius: 8px;
+    padding: 7px 14px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:hover { filter: brightness(1.1); }
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .ctl {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .ctl label { font-weight: 600; color: var(--ink); }
+  .ctl input[type="range"] { width: 110px; accent-color: var(--gate-deep); }
+  .ctl .val {
+    background: #f3f4ff;
+    padding: 2px 7px;
+    border-radius: 5px;
+    font-variant-numeric: tabular-nums;
+    color: var(--gate-deep);
+    font-weight: 600;
+    min-width: 28px;
+    text-align: center;
+  }
+
+  main {
+    padding: 18px 24px 32px;
+    max-width: 1700px;
+    margin: 0 auto;
+  }
+
+  .stage {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 18px;
+    overflow-x: auto;
+  }
+
+  .pipeline {
+    display: grid;
+    grid-template-columns: 90px 70px 200px 1fr 130px;
+    gap: 14px;
+    align-items: stretch;
+    min-width: 1100px;
+  }
+
+  .col {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+  }
+  .col-title {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+    font-weight: 700;
+    margin-bottom: 4px;
+    text-align: center;
+  }
+  .col-title.accent { color: var(--gate-deep); }
+
+  /* Tokens column */
+  .tokens { gap: 6px; padding-top: 22px; }
+  .token {
+    width: 100%;
+    text-align: right;
+    font-family: "SF Mono", "Menlo", monospace;
+    font-size: 12px;
+    color: var(--ink);
+    padding: 6px 8px;
+    border-radius: 6px;
+    transition: all 0.2s;
+  }
+  .token.active {
+    background: #f3f4ff;
+    color: var(--gate-deep);
+    font-weight: 700;
+  }
+
+  /* Embedding column - vertical stripes */
+  .embedding { gap: 6px; padding-top: 22px; }
+  .stripe {
+    width: 56px;
+    height: 22px;
+    border-radius: 4px;
+    background: linear-gradient(90deg, #e0e7ff 0%, #c7d2fe 30%, #a5b4fc 60%, #93c5fd 100%);
+    position: relative;
+  }
+  .stripe::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: 4px;
+    background: linear-gradient(180deg, rgba(255,255,255,0.4), transparent);
+  }
+  .stripe.active { box-shadow: 0 0 0 2px var(--gate-deep); }
+
+  /* Attention column (greyed) */
+  .attn-block {
+    background: repeating-linear-gradient(
+      45deg,
+      #f1f5f9,
+      #f1f5f9 6px,
+      #e2e8f0 6px,
+      #e2e8f0 12px
+    );
+    border: 1.5px dashed var(--attn-ink);
+    border-radius: 10px;
+    padding: 14px 12px;
+    width: 100%;
+    text-align: center;
+    color: var(--muted);
+  }
+  .attn-block .qkv {
+    display: flex;
+    justify-content: space-around;
+    margin: 10px 0 8px;
+    font-family: "SF Mono", monospace;
+    font-size: 11px;
+    color: var(--attn-ink);
+    font-weight: 700;
+  }
+  .attn-block .qkv span {
+    background: white;
+    border: 1px solid var(--attn-ink);
+    border-radius: 4px;
+    padding: 2px 6px;
+  }
+  .attn-block .label { font-weight: 700; color: var(--ink); margin-bottom: 6px; font-size: 12px; }
+  .attn-block .note { font-size: 11px; line-height: 1.4; }
+
+  /* MLP-as-graph column */
+  .mlp-graph {
+    width: 100%;
+    background: #fcfcff;
+    border: 1.5px solid var(--gate);
+    border-radius: 10px;
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .mlp-graph .label {
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--gate-deep);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .mlp-graph .label .pill {
+    background: var(--gate);
+    color: var(--gate-deep);
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+  }
+
+  .feature-grid {
+    display: grid;
+    grid-template-columns: repeat(64, 1fr);
+    gap: 2px;
+    padding: 8px;
+    background: white;
+    border-radius: 6px;
+    border: 1px solid var(--line);
+  }
+  .feature-dot {
+    width: 100%;
+    aspect-ratio: 1 / 1;
+    border-radius: 50%;
+    background: #e5e7eb;
+    transition: all 0.3s;
+    cursor: pointer;
+  }
+  .feature-dot.fired {
+    background: var(--fire-deep);
+    box-shadow: 0 0 0 1.5px var(--fire), 0 0 6px var(--fire-deep);
+    transform: scale(1.5);
+    z-index: 2;
+    position: relative;
+  }
+  .feature-dot:hover {
+    background: var(--gate-deep);
+    transform: scale(1.4);
+    z-index: 3;
+  }
+
+  .step {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 12px;
+  }
+  .step .arrow {
+    width: 0;
+    height: 0;
+    border-left: 8px solid var(--gate-deep);
+    border-top: 6px solid transparent;
+    border-bottom: 6px solid transparent;
+  }
+  .step .text { color: var(--muted); }
+  .step .text strong { color: var(--ink); }
+
+  .fired-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    background: white;
+    padding: 8px;
+    border-radius: 6px;
+    border: 1px solid var(--line);
+    min-height: 40px;
+  }
+  .fired-chip {
+    background: linear-gradient(135deg, #fce7f3, #fbcfe8);
+    border: 1px solid var(--fire);
+    border-radius: 6px;
+    padding: 4px 8px;
+    font-family: "SF Mono", monospace;
+    font-size: 11px;
+    color: var(--fire-deep);
+    font-weight: 700;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .fired-chip:hover {
+    background: var(--fire-deep);
+    color: white;
+  }
+  .fired-chip.selected {
+    background: var(--fire-deep);
+    color: white;
+  }
+  .fired-chip .act {
+    color: rgba(0,0,0,0.5);
+    margin-left: 4px;
+    font-weight: 500;
+  }
+  .fired-chip.selected .act { color: rgba(255,255,255,0.7); }
+
+  /* Probabilities column */
+  .probs { gap: 4px; padding-top: 22px; width: 100%; }
+  .prob-row {
+    display: grid;
+    grid-template-columns: 60px 1fr 38px;
+    gap: 6px;
+    align-items: center;
+    font-size: 11px;
+  }
+  .prob-tok {
+    text-align: right;
+    font-family: "SF Mono", monospace;
+    color: var(--ink);
+  }
+  .prob-tok.top { color: var(--gate-deep); font-weight: 700; }
+  .prob-bar {
+    height: 8px;
+    background: #f3f4f6;
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .prob-bar .fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--probs), var(--probs-deep));
+    border-radius: 4px;
+  }
+  .prob-pct {
+    font-variant-numeric: tabular-nums;
+    color: var(--muted);
+    font-size: 10px;
+  }
+
+  /* Layer strip */
+  .layer-strip {
+    margin-top: 14px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 10px 14px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .layer-strip .lbl {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+    font-weight: 700;
+  }
+  .layer-cells {
+    display: grid;
+    grid-template-columns: repeat(34, 1fr);
+    gap: 3px;
+    flex: 1;
+  }
+  .layer-cell {
+    aspect-ratio: 1;
+    border-radius: 4px;
+    background: #e0e7ff;
+    cursor: pointer;
+    border: 1.5px solid transparent;
+    transition: all 0.15s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 9px;
+    color: var(--gate-deep);
+    font-weight: 600;
+  }
+  .layer-cell:hover { background: var(--gate); }
+  .layer-cell.active {
+    background: var(--gate-deep);
+    color: white;
+    border-color: var(--ink);
+  }
+
+  /* Feature inspector */
+  .inspector {
+    margin-top: 14px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 16px;
+  }
+  .inspector .head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 12px;
+  }
+  .inspector h2 {
+    font-size: 13px;
+    margin: 0;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--ink);
+  }
+  .inspector .ctx {
+    font-size: 11px;
+    color: var(--muted);
+    font-family: "SF Mono", monospace;
+  }
+  .features-table {
+    display: grid;
+    grid-template-columns: 90px 80px 1fr 1fr;
+    gap: 10px;
+    font-size: 12px;
+    align-items: center;
+  }
+  .features-table .header {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+    font-weight: 700;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--line);
+  }
+  .features-table .row {
+    padding: 8px 0;
+    border-bottom: 1px solid #f3f4f6;
+  }
+  .features-table .row.selected {
+    background: #fdf2f8;
+    border-radius: 6px;
+    padding: 8px 10px;
+    margin: 0 -10px;
+  }
+  .features-table .id {
+    font-family: "SF Mono", monospace;
+    font-weight: 700;
+    color: var(--fire-deep);
+  }
+  .features-table .act {
+    font-family: "SF Mono", monospace;
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+  }
+  .vec-viz {
+    display: flex;
+    gap: 1px;
+    height: 18px;
+    border-radius: 3px;
+    overflow: hidden;
+    background: #f3f4f6;
+  }
+  .vec-cell {
+    flex: 1;
+    height: 100%;
+  }
+
+  /* Legend */
+  .legend {
+    display: flex;
+    gap: 14px;
+    margin-top: 10px;
+    font-size: 11px;
+    color: var(--muted);
+    flex-wrap: wrap;
+  }
+  .legend .item { display: flex; align-items: center; gap: 6px; }
+  .legend .swatch {
+    width: 12px;
+    height: 12px;
+    border-radius: 3px;
+  }
+
+  /* Footnote */
+  .footnote {
+    margin-top: 18px;
+    font-size: 12px;
+    color: var(--muted);
+    line-height: 1.6;
+    padding: 14px 16px;
+    background: #fffbeb;
+    border-left: 3px solid var(--probs-deep);
+    border-radius: 4px;
+  }
+  .footnote code {
+    background: #fef3c7;
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-size: 11px;
+    color: var(--probs-deep);
+  }
+
+  /* Walk arrow overlay */
+  .arrow-block {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    color: var(--gate-deep);
+    font-size: 11px;
+    font-weight: 700;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>LARQL Explainer <span class="sub">FFN as a feature graph · Gemma-3 4B</span></h1>
+  <div class="prompt-bar">
+    <span style="color:var(--muted);font-size:11px;font-weight:700;">PROMPT</span>
+    <input id="prompt" value="Data visualization empowers users to" />
+    <span class="next">→ see</span>
+  </div>
+  <button onclick="rerun()">WALK</button>
+  <div class="controls">
+    <div class="ctl">
+      <label>Layer</label>
+      <input type="range" id="layer" min="0" max="33" value="10" />
+      <span class="val" id="layer-val">10</span>
+    </div>
+    <div class="ctl">
+      <label>K</label>
+      <input type="range" id="k" min="1" max="32" value="10" />
+      <span class="val" id="k-val">10</span>
+    </div>
+  </div>
+</header>
+
+<main>
+  <div class="stage">
+    <div class="pipeline">
+
+      <!-- Tokens -->
+      <div class="col tokens">
+        <div class="col-title">Tokens</div>
+        <div class="token">Data</div>
+        <div class="token">visualization</div>
+        <div class="token">em</div>
+        <div class="token">powers</div>
+        <div class="token">users</div>
+        <div class="token active">to</div>
+      </div>
+
+      <!-- Embedding -->
+      <div class="col embedding">
+        <div class="col-title">Embedding</div>
+        <div class="stripe"></div>
+        <div class="stripe"></div>
+        <div class="stripe"></div>
+        <div class="stripe"></div>
+        <div class="stripe"></div>
+        <div class="stripe active"></div>
+      </div>
+
+      <!-- Attention (untouched) -->
+      <div class="col">
+        <div class="col-title">Multi-head Attention</div>
+        <div class="attn-block">
+          <div class="label">Unchanged by LARQL</div>
+          <div class="qkv"><span>Q</span><span>K</span><span>V</span></div>
+          <div class="note">Standard BLAS-fused attention. Same Q/K/V, same softmax, same Out projection.</div>
+        </div>
+      </div>
+
+      <!-- MLP as graph -->
+      <div class="col" style="align-items: stretch;">
+        <div class="col-title accent">MLP / FFN — reframed as a feature graph</div>
+        <div class="mlp-graph">
+          <div class="label">
+            <span>Layer <span id="layer-disp">10</span> · feature index</span>
+            <span class="pill">10,240 NODES</span>
+          </div>
+          <div class="feature-grid" id="grid"></div>
+
+          <div class="step">
+            <div class="arrow"></div>
+            <div class="text"><strong>1.</strong> KNN: <code style="background:#f3f4ff;padding:1px 4px;border-radius:3px;">gate_vectors · x</code> → top-K matches</div>
+          </div>
+
+          <div class="step">
+            <div class="arrow"></div>
+            <div class="text"><strong>2.</strong> Fired features (each fires with its activation scalar):</div>
+          </div>
+          <div class="fired-row" id="fired"></div>
+
+          <div class="step">
+            <div class="arrow"></div>
+            <div class="text"><strong>3.</strong> Sum down vectors weighted by activation → write back to residual</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Probabilities -->
+      <div class="col probs">
+        <div class="col-title">Probabilities</div>
+        <div class="prob-row"><div class="prob-tok top">visualize</div><div class="prob-bar"><div class="fill" style="width:54.67%"></div></div><div class="prob-pct">54.7%</div></div>
+        <div class="prob-row"><div class="prob-tok">create</div><div class="prob-bar"><div class="fill" style="width:20.87%"></div></div><div class="prob-pct">20.9%</div></div>
+        <div class="prob-row"><div class="prob-tok">see</div><div class="prob-bar"><div class="fill" style="width:12.09%"></div></div><div class="prob-pct">12.1%</div></div>
+        <div class="prob-row"><div class="prob-tok">make</div><div class="prob-bar"><div class="fill" style="width:6.26%"></div></div><div class="prob-pct">6.3%</div></div>
+        <div class="prob-row"><div class="prob-tok">easily</div><div class="prob-bar"><div class="fill" style="width:6.11%"></div></div><div class="prob-pct">6.1%</div></div>
+      </div>
+    </div>
+
+    <div class="legend">
+      <div class="item"><div class="swatch" style="background:#e5e7eb;"></div>idle feature</div>
+      <div class="item"><div class="swatch" style="background:var(--fire-deep);"></div>fired (top-K matched current residual)</div>
+      <div class="item"><div class="swatch" style="background:var(--gate);"></div>gate vector dimension (positive)</div>
+      <div class="item"><div class="swatch" style="background:var(--down);"></div>down vector dimension (positive)</div>
+    </div>
+  </div>
+
+  <!-- Layer strip -->
+  <div class="layer-strip">
+    <div class="lbl">34 LAYERS</div>
+    <div class="layer-cells" id="layer-cells"></div>
+  </div>
+
+  <!-- Inspector -->
+  <div class="inspector">
+    <div class="head">
+      <h2>Fired features at layer <span id="ins-layer">10</span></h2>
+      <div class="ctx">walk over residual stream <code style="background:#f3f4ff;padding:1px 5px;border-radius:3px;color:var(--gate-deep);">x</code> for token <code style="background:#f3f4ff;padding:1px 5px;border-radius:3px;color:var(--gate-deep);">"to"</code></div>
+    </div>
+    <div class="features-table" id="table">
+      <div class="header">FEATURE</div>
+      <div class="header">ACTIVATION</div>
+      <div class="header">GATE VECTOR (snapshot, 64 of 2,560 dims)</div>
+      <div class="header">DOWN VECTOR (snapshot, 64 of 2,560 dims)</div>
+    </div>
+  </div>
+
+  <!-- Footnote -->
+  <div class="footnote">
+    <strong>How to read this:</strong>
+    The left half (tokens, embedding, attention, probabilities) is identical to the standard transformer pipeline shown in the
+    <a href="https://poloclub.github.io/transformer-explainer/" target="_blank" style="color:var(--gate-deep);">Transformer Explainer</a>.
+    The middle <strong>MLP panel</strong> is what LARQL reorganizes: instead of a dense
+    <code>up</code>→GeGLU→<code>down</code> matmul, the 10,240 intermediate neurons become a
+    queryable feature index. The forward pass becomes a <strong>walk</strong>: KNN over gate vectors finds the top-K nodes that match the
+    residual <code>x</code>, only those features fire, and only their down vectors get summed back. Each layer has its own
+    independent feature graph; on Gemma-3 4B that's 34 graphs of ~10,240 nodes each.
+    Numbers shown are illustrative — drag the <strong>Layer</strong> and <strong>K</strong> sliders to see the walk change.
+  </div>
+</main>
+
+<script>
+  // Mock data: 10240 features per layer; pick top-K based on a deterministic seed per layer
+  const TOTAL_FEATURES = 10240;
+  const GRID_SIZE = 64 * 12; // 64 cols × 12 rows = 768 dots shown (representative sample)
+
+  const tokenLabels = ["visualize", "create", "see", "make", "easily"];
+
+  // Pseudo-random with seed for repeatability
+  function mulberry32(seed) {
+    return function() {
+      seed = (seed + 0x6D2B79F5) | 0;
+      let t = seed;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  const featureNames = {
+    // illustrative pseudo-labels for a few layers
+    "10:3120": "next-token: visualize",
+    "10:7841": "noun→verb completion",
+    "10:512":  "subject 'users' tracker",
+    "10:1934": "tech/UI vocabulary",
+    "10:8002": "imperative continuation",
+    "10:6618": "abstract verbs",
+    "14:204":  "domain: data viz",
+    "5:9912":  "syntactic 'to + verb'",
+    "20:78":   "completion confidence",
+  };
+
+  function pickFired(layer, k) {
+    const rnd = mulberry32(1000 + layer * 31);
+    const indices = [];
+    for (let i = 0; i < k; i++) {
+      indices.push(Math.floor(rnd() * TOTAL_FEATURES));
+    }
+    // assign activations descending
+    const acts = indices.map((_, i) => +(6 - i * (5.5 / k) + rnd() * 0.5).toFixed(2));
+    return indices.map((id, i) => ({ id, act: Math.max(0.05, acts[i]) }));
+  }
+
+  function pickFiredGridSlots(layer, k) {
+    // map each fired feature to a position in the visible grid (representative)
+    const rnd = mulberry32(7000 + layer * 13);
+    const slots = new Set();
+    while (slots.size < k) {
+      slots.add(Math.floor(rnd() * GRID_SIZE));
+    }
+    return Array.from(slots);
+  }
+
+  function vecViz(seed, dim, color) {
+    const rnd = mulberry32(seed);
+    const cells = [];
+    for (let i = 0; i < dim; i++) {
+      const v = (rnd() * 2 - 1);
+      const intensity = Math.abs(v);
+      const tone = v > 0
+        ? `rgba(${color.r}, ${color.g}, ${color.b}, ${0.15 + intensity * 0.85})`
+        : `rgba(244, 114, 182, ${0.10 + intensity * 0.55})`;
+      cells.push(`<div class="vec-cell" style="background:${tone};"></div>`);
+    }
+    return `<div class="vec-viz">${cells.join("")}</div>`;
+  }
+
+  let state = {
+    layer: 10,
+    k: 10,
+    selected: null,
+  };
+
+  function render() {
+    document.getElementById("layer-val").textContent = state.layer;
+    document.getElementById("k-val").textContent = state.k;
+    document.getElementById("layer-disp").textContent = state.layer;
+    document.getElementById("ins-layer").textContent = state.layer;
+
+    // grid
+    const grid = document.getElementById("grid");
+    const firedSlots = new Set(pickFiredGridSlots(state.layer, state.k));
+    let html = "";
+    for (let i = 0; i < GRID_SIZE; i++) {
+      html += `<div class="feature-dot ${firedSlots.has(i) ? "fired" : ""}"></div>`;
+    }
+    grid.innerHTML = html;
+
+    // fired chips
+    const fired = pickFired(state.layer, state.k);
+    const firedRow = document.getElementById("fired");
+    firedRow.innerHTML = fired.map((f, idx) => {
+      const sel = (state.selected === idx) ? "selected" : "";
+      return `<div class="fired-chip ${sel}" onclick="selectFeature(${idx})">#${f.id}<span class="act">${f.act.toFixed(2)}</span></div>`;
+    }).join("");
+
+    // table
+    const table = document.getElementById("table");
+    let rowsHtml = `
+      <div class="header">FEATURE</div>
+      <div class="header">ACTIVATION</div>
+      <div class="header">GATE VECTOR (snapshot, 64 of 2,560 dims)</div>
+      <div class="header">DOWN VECTOR (snapshot, 64 of 2,560 dims)</div>
+    `;
+    fired.forEach((f, idx) => {
+      const key = `${state.layer}:${f.id}`;
+      const label = featureNames[key];
+      const sel = (state.selected === idx) ? "selected" : "";
+      rowsHtml += `
+        <div class="row ${sel}"><span class="id">#${f.id}</span>${label ? `<div style="font-size:10px;color:var(--muted);margin-top:2px;">${label}</div>` : ""}</div>
+        <div class="row ${sel}"><span class="act">${f.act.toFixed(3)}</span></div>
+        <div class="row ${sel}">${vecViz(2000 + state.layer * 100 + f.id, 64, {r:124,g:58,b:237})}</div>
+        <div class="row ${sel}">${vecViz(5000 + state.layer * 100 + f.id, 64, {r:5,g:150,b:105})}</div>
+      `;
+    });
+    table.innerHTML = rowsHtml;
+
+    // layer strip
+    const cells = document.getElementById("layer-cells");
+    let cellsHtml = "";
+    for (let l = 0; l < 34; l++) {
+      cellsHtml += `<div class="layer-cell ${l === state.layer ? "active" : ""}" onclick="setLayer(${l})">${l}</div>`;
+    }
+    cells.innerHTML = cellsHtml;
+  }
+
+  function selectFeature(idx) {
+    state.selected = (state.selected === idx) ? null : idx;
+    render();
+  }
+
+  function setLayer(l) {
+    state.layer = l;
+    state.selected = null;
+    document.getElementById("layer").value = l;
+    render();
+  }
+
+  function rerun() {
+    state.selected = null;
+    render();
+  }
+
+  document.getElementById("layer").addEventListener("input", e => {
+    state.layer = +e.target.value;
+    state.selected = null;
+    render();
+  });
+  document.getElementById("k").addEventListener("input", e => {
+    state.k = +e.target.value;
+    state.selected = null;
+    render();
+  });
+
+  render();
+</script>
+
+</body>
+</html>

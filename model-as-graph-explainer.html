@@ -1,0 +1,907 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>From Model to Graph — How LARQL Turns a Transformer into a Vindex</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    background: #fafafa; color: #1a1a1a; line-height: 1.55;
+  }
+  .container { max-width: 1200px; margin: 0 auto; }
+  h1 { font-size: 28px; margin: 0 0 8px; }
+  h2 { font-size: 20px; margin: 32px 0 12px; }
+  .subtitle { color: #666; margin-bottom: 24px; }
+
+  .step {
+    background: white; padding: 20px; border-radius: 10px;
+    border: 1px solid #e3e3e3; margin-bottom: 20px;
+  }
+  .step-header {
+    font-weight: 700; font-size: 13px;
+    color: #2563eb; margin-bottom: 4px;
+    text-transform: uppercase; letter-spacing: 0.5px;
+  }
+  .step-title { font-size: 18px; font-weight: 600; margin-bottom: 8px; }
+  .step-desc { color: #555; margin-bottom: 16px; font-size: 15px; }
+
+  .equation {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    background: #f5f5f5; padding: 10px 14px; border-radius: 6px;
+    margin: 12px 0; font-size: 14px; color: #333;
+    border-left: 3px solid #2563eb;
+  }
+
+  .takeaway {
+    background: #fef9c3; border-left: 4px solid #ca8a04;
+    padding: 14px 18px; border-radius: 6px; margin-top: 16px; font-size: 14px;
+  }
+
+  /* Matrix styles */
+  .matrix-row { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; }
+  .matrix-block { display: flex; flex-direction: column; gap: 4px; }
+  .matrix-label { font-family: ui-monospace, monospace; font-size: 12px; font-weight: 600; }
+  .matrix-sub { font-size: 11px; color: #777; font-style: italic; }
+  .matrix { display: grid; gap: 2px; padding: 4px; border-radius: 6px; background: rgba(0,0,0,0.04); }
+  .cell {
+    width: 44px; height: 30px; display: flex; align-items: center; justify-content: center;
+    font-family: ui-monospace, monospace; font-size: 11px; background: white;
+    border-radius: 3px; border: 1px solid rgba(0,0,0,0.05);
+  }
+  .row-tag {
+    font-size: 10px; color: #555; font-style: italic;
+    height: 30px; display: flex; align-items: center; padding-right: 6px;
+    text-align: right; justify-content: flex-end;
+  }
+  .feature-tags { display: flex; flex-direction: column; gap: 2px; }
+
+  /* Color tints */
+  .gate-color { background: #dcfce7; }
+  .up-color   { background: #fef3c7; }
+  .down-color { background: #ede9fe; }
+
+  /* Graph styles */
+  .graph-wrap {
+    background: linear-gradient(180deg, #fcfcfd 0%, #f5f7fa 100%);
+    border-radius: 10px; padding: 20px;
+    border: 1px solid #e3e3e3;
+    overflow-x: auto;
+  }
+  svg.graph { display: block; margin: 0 auto; }
+  .layer-label {
+    font-size: 12px; font-weight: 600; fill: #555;
+    text-anchor: middle; font-family: ui-monospace, monospace;
+  }
+  .node circle {
+    fill: white; stroke: #4b5563; stroke-width: 2;
+    cursor: pointer; transition: all 0.2s;
+  }
+  .node:hover circle { stroke: #2563eb; stroke-width: 3; }
+  .node text {
+    font-size: 11px; font-weight: 600; text-anchor: middle;
+    pointer-events: none; fill: #1a1a1a;
+  }
+  .node-label {
+    font-size: 10px; fill: #555; text-anchor: middle;
+    pointer-events: none; font-style: italic;
+  }
+  .edge { stroke: #cbd5e1; fill: none; transition: all 0.2s; }
+  .edge.strong { stroke: #93c5fd; stroke-width: 2; }
+  .edge.weak { stroke: #e5e7eb; stroke-width: 1; }
+
+  /* Active walk */
+  .node.active circle { fill: #fde68a; stroke: #f59e0b; stroke-width: 3; }
+  .node.active text { fill: #78350f; }
+  .edge.active { stroke: #f59e0b; stroke-width: 3; }
+  .edge.dim { opacity: 0.15; }
+  .node.dim { opacity: 0.4; }
+
+  .controls {
+    background: white; padding: 16px; border-radius: 10px;
+    border: 1px solid #e3e3e3; margin-bottom: 24px;
+    display: flex; flex-wrap: wrap; gap: 12px; align-items: center;
+  }
+  button {
+    padding: 8px 14px; border: 1px solid #d0d0d0; background: white;
+    border-radius: 6px; cursor: pointer; font-size: 14px;
+  }
+  button:hover { background: #f0f0f0; }
+  button.active { background: #2563eb; color: white; border-color: #2563eb; }
+
+  .legend {
+    display: flex; flex-wrap: wrap; gap: 16px;
+    background: white; padding: 14px; border-radius: 10px;
+    border: 1px solid #e3e3e3; margin-bottom: 20px; font-size: 14px;
+  }
+  .legend-item { display: flex; align-items: center; gap: 8px; }
+  .legend-swatch { width: 18px; height: 18px; border-radius: 4px; border: 1px solid rgba(0,0,0,0.1); }
+  .legend-line { width: 24px; height: 3px; border-radius: 2px; }
+
+  .info-box {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 12px;
+  }
+  .info-card {
+    background: #f8fafc; padding: 12px 14px; border-radius: 6px;
+    border-left: 3px solid #2563eb; font-size: 13px;
+  }
+  .info-card b { color: #1e3a8a; }
+
+  details { margin-top: 12px; }
+  summary { cursor: pointer; color: #2563eb; font-size: 14px; user-select: none; }
+  details .body { font-size: 14px; color: #444; padding-left: 12px; border-left: 2px solid #e5e7eb; margin-top: 8px; }
+
+  .arrow-down { text-align: center; font-size: 24px; color: #94a3b8; margin: 8px 0; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>From Model to Graph</h1>
+  <p class="subtitle">How LARQL turns a stack of transformer matrices into a queryable graph (the <b>vindex</b>).</p>
+
+  <div class="legend">
+    <div class="legend-item"><div class="legend-swatch gate-color"></div>W_gate row = <b>key</b> (only this is indexed for KNN)</div>
+    <div class="legend-item"><div class="legend-swatch up-color"></div>W_up row = <b>gain</b> (multiplier in GEGLU)</div>
+    <div class="legend-item"><div class="legend-swatch down-color"></div>W_down row = <b>down vector</b> (feature-major, rebuilt)</div>
+    <div class="legend-item"><div class="legend-line" style="background:#86efac"></div>Subject → feature edge (Step 3)</div>
+    <div class="legend-item"><div class="legend-line" style="background:#c4b5fd"></div>Feature → object edge (Step 3)</div>
+    <div class="legend-item"><div class="legend-line" style="background:#f59e0b"></div>Walk path through fired features (Step 4)</div>
+  </div>
+
+  <!-- STEP 1 -->
+  <div class="step">
+    <div class="step-header">Step 1 · Stack of layers</div>
+    <div class="step-title">A transformer layer is attention + FFN; LARQL targets the FFN half</div>
+    <div class="step-desc">
+      Each transformer layer has two sub-blocks: <b>attention</b> (Q, K, V, O projections) and <b>FFN</b> (W_gate, W_up, W_down on modern gated architectures like Llama, Gemma, Mistral, GPT-OSS). LARQL doesn't turn the whole transformer into a graph — it decomposes only the FFN sub-block of each layer. Attention still runs as ordinary BLAS matmuls from the safetensors file, even on the walk path. The residual stream flows top-down through every layer, getting added to by attention and FFN in turn.
+      Below: a 4-layer toy model with 4 features per layer, with the four phases that real models exhibit (passive embedding work, active syntactic processing, factual knowledge, and output formatting — see <code>docs/findings.md</code> §2). Real Gemma-3 4B has 34 layers and 10,240 features per layer.
+    </div>
+
+    <div id="layers-stack"></div>
+
+    <div class="takeaway">
+      <b>Key idea:</b> A transformer is <i>attention + FFN, stacked</i>. The (W_gate, W_up, W_down) shape is specific to gated FFNs — older architectures (GPT-2, BERT) only have W_in and W_out and don't have an addressable per-feature key vector. The gate matrix is what makes the graph view possible: each row gives feature <i>i</i> a "key" that an input can be matched against.
+    </div>
+  </div>
+
+  <!-- STEP 2 -->
+  <div class="step">
+    <div class="step-header">Step 2 · Each feature becomes a node</div>
+    <div class="step-title">Flatten the matrices into a node list — but rebuild W_down first</div>
+    <div class="step-desc">
+      Every feature index <i>i</i> at layer L picks out the same row of W_gate and W_up (both stored <code>[intermediate, hidden]</code>). The catch: <b>W_down is stored transposed</b> as <code>[hidden, intermediate]</code> in safetensors, so feature <i>i</i> is the i-th <i>column</i> — scattered with stride <code>intermediate</code>. LARQL's <code>build_down_features</code> tool rebuilds it as feature-major <code>[intermediate, hidden]</code> in <code>down_features.bin</code>, so each feature's down vector becomes 2560 contiguous f32s (10 KB on Gemma-3 4B). Only after that rebuild is "row <i>i</i> = feature <i>i</i>'s value" true for all three matrices.
+    </div>
+    <div class="equation">node(L, i)  =  { key: W_gate[L][i],  up: W_up[L][i],  down: W_down_feature_major[L][i] }</div>
+
+    <div class="graph-wrap">
+      <svg class="graph" id="graph-nodes-only" width="1080" height="380"></svg>
+      <div style="font-size:12px;color:#666;font-style:italic;text-align:center;margin-top:8px;padding:8px 12px;background:rgba(255,255,255,0.6);border-radius:4px;">
+        This is the <b>walk graph</b> — features as runtime traversal nodes. It's <i>not</i> the same as the persisted edge graph in Step 3, where the nodes are tokens and features are edge labels. Both views describe the same FFN; LARQL exposes both.
+      </div>
+    </div>
+
+    <div class="takeaway">
+      A node is <code>(L, i)</code> — the same index <i>i</i> at a different layer is a different node, because gate vectors are <i>layer-specific</i> (calibrated to each layer's residual space). On Gemma-3 4B that's 34 × 10,240 ≈ <b>348k nodes</b>.<br/><br/>
+      <b>Only the gate vector is indexed</b> for KNN/graph traversal — the up and down vectors are payload, fetched once you've decided to "visit" a node. up_features.bin is optional (built only when you want a full-mmap walk).
+    </div>
+  </div>
+
+  <!-- STEP 3 -->
+  <div class="step">
+    <div class="step-header">Step 3 · Each feature is itself an edge</div>
+    <div class="step-title">Edges go token → feature → token, not feature → feature</div>
+    <div class="step-desc">
+      The natural intuition — "feature <i>i</i> in layer L talks to feature <i>j</i> in L+1 when their value and key align" — is mathematically sensible (it's the FFN-FFN composition strength) but <b>it's not how LARQL actually defines its edges</b>. LARQL's nodes are <i>tokens</i>, not features. Each FFN feature becomes one (or a few) edges of the form <code>(subject_token, L{layer}-F{feature}, object_token)</code>. The schema lives in <code>crates/larql-core/src/core/edge.rs</code> and <code>docs/format.md</code>.
+    </div>
+    <div class="equation">
+subjects(L, i) = top-K tokens by  dot(W_gate[L,i],  E[token])<br/>
+objects(L, i)  = top-K tokens by  dot(W_down[L,i],  E[token])<br/>
+edge          = (subject, "L{L}-F{i}", object,  confidence)
+    </div>
+    <div class="step-desc" style="margin-top:14px;">
+      Two KNN sweeps per feature, both against the vocabulary embedding matrix <code>E</code>: project the gate vector to find the tokens that excite this feature (subjects), project the down vector to find the tokens it pushes toward (objects). Cartesian product → emit edges. Why this works: the residual stream lives in embedding space at the input, and modern transformers preserve that alignment well enough that gate and down vectors stay roughly readable in vocabulary space. Concrete edge from a real Gemma-3 4B vindex:
+    </div>
+    <div class="equation" style="border-left-color:#22c55e">{ "s": "France", "r": "L26-F9298", "o": "Paris", "c": 0.89, "src": "parametric" }</div>
+
+    <div class="info-box">
+      <div class="info-card">
+        <b>High c_in × c_out →</b> feature has a clear "trigger token" and a clear "output token." Strong, factual edge — usually late layers.
+      </div>
+      <div class="info-card">
+        <b>Diffuse projections →</b> ~85% of features ("dark space") have down vectors that don't resolve to any single token. Structural computation, not entity knowledge.
+      </div>
+    </div>
+
+    <div class="graph-wrap" style="margin-top:16px;">
+      <svg class="graph" id="graph-with-edges" width="1080" height="560"></svg>
+      <div style="font-size:12px;color:#666;font-style:italic;text-align:center;margin-top:8px;padding:8px 12px;background:rgba(255,255,255,0.6);border-radius:4px;">
+        The persisted edge graph: each FFN feature becomes ~K subject × K object edges between tokens. The example shows three real-style features and the edges they generate.
+      </div>
+    </div>
+
+    <div class="takeaway">
+      <b>The graph wasn't trained — it was always there.</b> 348k features → ~8M edges (each feature's top-K subjects × top-K objects). Confidence is per-layer-normalized, with two flavors: <code>c</code> (combined signal, biased toward structural edges) and <code>selectivity</code> (input specificity, biased toward factual edges). For knowledge extraction, filter on <code>selectivity</code> + late layers (L19–L29 for Gemma-3 4B).
+    </div>
+  </div>
+
+  <!-- STEP 4 -->
+  <div class="step">
+    <div class="step-header">Step 4 · Inference is a walk</div>
+    <div class="step-title">An input traces a path through the graph</div>
+    <div class="step-desc">
+      When a token enters the model, its embedding (scaled by <code>√hidden_size</code> on Gemma) becomes the layer-0 residual. Each layer runs <b>attention then FFN</b>, both reading from and adding to the same residual stream. The FFN's contribution is the graph walk:
+    </div>
+    <div class="equation">
+1.  score_i  = dot(residual, W_gate[L,i])  for all i      ← KNN ranks by this<br/>
+2.  pick top-K features by score (K ≈ 10 of 10,240)<br/>
+3.  up_i     = dot(residual, W_up[L,i])    for the K picked<br/>
+4.  act_i    = silu(score_i) * up_i                       ← GEGLU magnitude<br/>
+5.  residual += sum_k  act_k * W_down[L,k]
+    </div>
+    <div class="step-desc" style="margin-top:14px;">
+      <b>Selection vs. magnitude:</b> step 1's gate score is the <i>only</i> selection criterion — that's what makes it a graph walk (KNN on gate vectors). The <code>silu(gate) * up</code> in step 4 is the activation <i>magnitude</i> of an already-selected feature, not a re-ranker. (A feature with high gate score but near-zero up score still gets visited; it just contributes ~nothing.)<br/><br/>
+      <b>Two walks share the name.</b> The <i>conceptual graph walk</i> is the sparse top-K version above — what makes "inference is a walk" a true sentence; it's the path used for <code>WALK</code> traces and the no-down-features fallback. The <i>exact walk</i> (the production fast path, 517 ms vs 535 ms dense) is mathematically dense — all 10,240 features participate — but reads the down projection from the feature-major <code>down_features.bin</code> mmap. Same arithmetic as dense FFN, better page cache. The boundary-sweep proof of "zero divergence at every layer" is for the exact walk; the sparse walk is an approximation.<br/><br/>
+      <b>Attention is the missing index.</b> The FFN graph stores all knowledge; attention picks <i>which</i> features to activate for a given query. <code>findings.md</code> §6 reports that statically-extracted features and actually-activated features have ~zero overlap — attention routes "Germany" to features whose static subject keys are "französisch" / "немец" based on context.
+    </div>
+
+    <div class="controls">
+      <span style="font-weight:600">Try an input token:</span>
+      <button data-input="cat" class="active">"cat"</button>
+      <button data-input="dog">"dog"</button>
+      <button data-input="seven">"seven"</button>
+      <button data-input="run">"run"</button>
+    </div>
+
+    <div class="graph-wrap">
+      <svg class="graph" id="graph-walk" width="1080" height="380"></svg>
+    </div>
+
+    <div id="walk-explanation" class="takeaway"></div>
+  </div>
+
+  <!-- STEP 5 -->
+  <div class="step">
+    <div class="step-header">Step 5 · The vindex is this graph, on disk</div>
+    <div class="step-title">What LARQL actually stores</div>
+    <div class="step-desc">
+      The vindex directory holds the graph in mmap-friendly form. Three <b>extract levels</b> gate which files exist: <code>browse</code> (~3 GB) gives you the FFN graph data; <code>inference</code> (~6 GB) adds the attention + embedding weights needed to run a forward pass; <code>all</code> (~10 GB) adds dense weight files needed for <code>COMPILE</code> to bake patches back into a new vindex. Filenames live in <code>crates/larql-vindex/src/format/filenames.rs</code>.
+    </div>
+
+    <div class="equation" style="border-left-color:#22c55e">
+<b># top-level descriptor + provenance</b><br/>
+index.json                  →  per-layer offsets, dtypes, quantization, extract level<br/>
+weight_manifest.json        →  checksums for upstream HF weights<br/>
+tokenizer.json + configs    →  tokenizer + generation config<br/>
+<br/>
+<b># browse level — graph data (FFN-as-graph)</b><br/>
+gate_vectors.bin            →  node keys, layer-major (per-layer offsets in index.json)<br/>
+down_features.bin           →  node values, feature-major [intermediate, hidden] per layer<br/>
+down_meta.bin / .jsonl      →  per-feature metadata (top tokens, scores)<br/>
+feature_labels.json         →  human-readable node labels<br/>
+feature_clusters.jsonl      →  cluster assignments<br/>
+<br/>
+<b># inference level — needed to run forward</b><br/>
+embeddings.bin              →  token embedding matrix<br/>
+attn_weights.bin            →  attention Q/K/V/O (with _q4 / _kquant variants)<br/>
+norms.bin                   →  RMSNorm scales<br/>
+up_features.bin             →  feature-major up vectors (full-mmap walk)<br/>
+knn_store.bin               →  optional HNSW graph<br/>
+<br/>
+<b># all level — needed to recompile</b><br/>
+gate_weights.bin / up_weights.bin / down_weights.bin<br/>
+<br/>
+<b># patches (separate from base — overlay via PatchedVindex)</b><br/>
+*.vlp                       →  JSON overlays from INSERT / DELETE / UPDATE
+    </div>
+
+    <div class="takeaway" style="margin-top:16px;">
+      <b>Edge triples don't live in the vindex.</b> The <code>(France, L26-F9298, Paris, 0.89)</code> triples from Step 3 are produced by <code>weight-extract</code> and stored in <i>separate</i> <code>.larql.json</code> / <code>.larql.bin</code> files (see <code>docs/format.md</code>). The vindex stores the <b>vectors</b> — the structural graph — and triples are a downstream materialization computed by KNN against the embedding matrix. Two views, same content, different files.
+    </div>
+
+    <details>
+      <summary>How does this enable LQL queries?</summary>
+      <div class="body">
+        Three extraction levels gate which statements work: <code>browse</code> → DESCRIBE / WALK / SELECT, <code>inference</code> → +INFER, <code>all</code> → +COMPILE.<br/><br/>
+        <code>WALK FROM "cat"</code> traces the activation path through layers — the orange path above.<br/>
+        <code>SELECT * FROM features WHERE layer = 1</code> reads node metadata for one layer.<br/>
+        <code>DESCRIBE FEATURE 1.2</code> shows the key / up / down vectors of node (1, 2).<br/>
+        <code>INSERT FEATURE INTO 1 ...</code> adds a new node — a (key, up, down) triple — without retraining. The mutation lands in a <code>.vlp</code> patch file, never the base vindex.<br/>
+        Because everything is mmap'd, queries are zero-copy. The graph <i>is</i> the file.
+      </div>
+    </details>
+
+    <details>
+      <summary>Why not store edges as adjacency lists in the vindex?</summary>
+      <div class="body">
+        Two reasons. First, the conceptual feature(L) → feature(L+1) graph is dense: 348k nodes with ~10k potential outgoing edges each ≈ 3.5B candidate edges — and most of those interactions are mediated by attention in between, so they aren't stable across inputs. Second, the actually-defined edges (token → feature → token) <i>are</i> precomputed and stored — just not in the vindex. They live in standalone <code>.larql.json</code> / <code>.larql.bin</code> files (~8M edges per Gemma-3 4B model). The vindex stays as raw vectors; the triples view is a separate materialization that you can publish, query, and version independently.<br/><br/>
+        At runtime, the <b>walk</b> still recomputes its top-K via gate KNN against the live residual rather than reading a pre-built outgoing list — that's why Walk FFN is sparse-by-design and (with the down-features mmap) faster than dense.
+      </div>
+    </details>
+
+    <details>
+      <summary>Why are base vindexes immutable?</summary>
+      <div class="body">
+        It's a hard architectural invariant (see <code>AGENTS.md</code>): all mutations flow through <code>PatchedVindex</code>, which overlays a <code>.vlp</code> JSON patch on top of the readonly base. <code>SAVE PATCH</code> persists it. <code>COMPILE CURRENT INTO VINDEX</code> bakes patches into a fresh standalone vindex by hardlinking unchanged base files (APFS fast path) and rewriting only <code>down_weights.bin</code> column-wise where features changed. This makes vindexes safe to share, version, and stack patches on — the base is content-addressable and never mutated.
+      </div>
+    </details>
+  </div>
+</div>
+
+<script>
+// ----- toy 4-layer model -----
+// 4 features per layer, d_model = 4. The four layers map to the four
+// phases real models exhibit (see findings.md §2): passive, active,
+// knowledge, format gate. Crafted so the walk story is interpretable.
+
+// Each feature has three vectors: key (W_gate row), up (W_up row),
+// value (W_down row, *after* the feature-major rebuild). The up vectors are
+// deliberately not equal to the key vectors so GEGLU has non-trivial
+// behaviour — silu(gate) * up can disagree with silu(gate) * gate.
+//
+// Four layers map to the four phases in docs/findings.md §2:
+//   L0  passive       (real Gemma-3 4B: L0–L6   — embedding transformation)
+//   L1  active        (real:            L7–L18  — syntax / morphology / suppression)
+//   L2  knowledge     (real:            L19–L29 — factual bridges, peak L26–L27)
+//   L3  format gate   (real:            L30–L33 — output formatting, identity preservation)
+//
+// The famous (France, L26-F9298, Paris) edge from docs/findings.md sits in
+// the knowledge phase. Toy-equivalent edges live at L2 in this model.
+const LAYERS = [
+  { // L0 — passive: pull surface tokens forward, lightly amplified
+    name: "Layer 0",
+    role: "passive — surface tokens",
+    features: [
+      { name: "tok-cat",   key: [ 0.9, -0.2,  0.1,  0.0], up: [ 0.8,  0.0,  0.2,  0.0], value: [ 0.7,  0.0,  0.1,  0.0] },
+      { name: "tok-dog",   key: [-0.3,  0.9,  0.1,  0.0], up: [-0.2,  0.8,  0.0,  0.0], value: [ 0.0,  0.7,  0.1,  0.0] },
+      { name: "tok-num",   key: [ 0.0,  0.1,  0.9,  0.3], up: [ 0.1,  0.0,  0.7,  0.4], value: [ 0.0,  0.0,  0.7,  0.2] },
+      { name: "tok-verb",  key: [ 0.1,  0.0, -0.2,  0.9], up: [ 0.0,  0.1, -0.1,  0.7], value: [ 0.0,  0.0, -0.1,  0.7] },
+    ],
+  },
+  { // L1 — active: syntactic / morphological tagging
+    name: "Layer 1",
+    role: "active — syntax & morphology",
+    features: [
+      { name: "is-animal-noun", key: [ 0.5,  0.5,  0.0,  0.0], up: [ 0.4,  0.4, -0.1,  0.0], value: [ 0.3,  0.3,  0.0,  0.2] },
+      { name: "is-numeral",     key: [ 0.0,  0.1,  0.7,  0.3], up: [ 0.0,  0.0,  0.6,  0.3], value: [ 0.0,  0.0,  0.4,  0.3] },
+      { name: "is-action",      key: [-0.1, -0.1,  0.0,  0.8], up: [ 0.0,  0.0,  0.1,  0.7], value: [ 0.0,  0.0,  0.1,  0.5] },
+      { name: "structural",     key: [ 0.1,  0.1,  0.1,  0.1], up: [ 0.1,  0.1,  0.1,  0.1], value: [ 0.1,  0.0,  0.0,  0.1] },
+    ],
+  },
+  { // L2 — knowledge: factual / categorical features (the (subject, feature, object) edges live here)
+    name: "Layer 2",
+    role: "knowledge — facts & concepts",
+    features: [
+      { name: "concept-pet",      key: [ 0.4,  0.4, -0.1,  0.1], up: [ 0.3,  0.3,  0.0,  0.0], value: [ 0.5,  0.5, -0.2,  0.3] },
+      { name: "concept-quantity", key: [ 0.0,  0.0,  0.5,  0.4], up: [ 0.0,  0.0,  0.4,  0.3], value: [ 0.0, -0.1,  0.5,  0.5] },
+      { name: "concept-motion",   key: [-0.1,  0.0,  0.0,  0.7], up: [ 0.0,  0.0,  0.1,  0.6], value: [ 0.0,  0.0,  0.1,  0.6] },
+      { name: "knowledge-dark",   key: [ 0.1,  0.1,  0.1,  0.1], up: [ 0.1,  0.1,  0.1,  0.1], value: [ 0.1,  0.1,  0.0,  0.0] },
+    ],
+  },
+  { // L3 — format gate: output role / identity / inversion
+    name: "Layer 3",
+    role: "format gate — output control",
+    features: [
+      { name: "out-noun-phrase", key: [ 0.4,  0.4, -0.1,  0.1], up: [ 0.3,  0.3,  0.0,  0.1], value: [ 0.4,  0.3,  0.0,  0.2] },
+      { name: "out-subject",     key: [ 0.2,  0.2,  0.3,  0.4], up: [ 0.2,  0.2,  0.2,  0.3], value: [ 0.3,  0.2,  0.1,  0.1] },
+      { name: "out-quantifier",  key: [-0.1, -0.1,  0.5,  0.4], up: [ 0.0,  0.0,  0.4,  0.3], value: [-0.1,  0.0,  0.4,  0.4] },
+      { name: "out-predicate",   key: [-0.2,  0.0, -0.1,  0.7], up: [ 0.0,  0.0,  0.1,  0.6], value: [ 0.0,  0.0,  0.0,  0.6] },
+    ],
+  },
+];
+
+// Top-K used by the walk (real Gemma-3 4B uses K≈10 of 10,240 features).
+// In the toy we have 4 features per layer, so K=1 illustrates the sparsity
+// without making the picture trivial.
+const WALK_K = 1;
+
+// Toy "edge graph" used by Step 3's figure. These are LARQL's actual edge
+// schema: subject_token → (feature) → object_token, derived from KNN of the
+// feature's gate / down vectors against the embedding matrix. Confidences
+// are toy values; in real vindexes they come from c_in × c_out per layer.
+//
+// All three example features come from the *knowledge* layer (L2), since
+// per docs/findings.md that's where factual edges concentrate (peak at
+// real-Gemma L26–L27; the canonical (France, L26-F9298, Paris) example).
+const TOKEN_FEATURE_EDGES = [
+  {
+    layer: 2, feat: 0, name: "concept-pet",
+    subjects: [{token: "cat", c: 0.84}, {token: "dog", c: 0.81}, {token: "kitten", c: 0.71}],
+    objects:  [{token: "pet", c: 0.78}, {token: "animal", c: 0.74}, {token: "creature", c: 0.61}],
+  },
+  {
+    layer: 2, feat: 1, name: "concept-quantity",
+    subjects: [{token: "seven", c: 0.79}, {token: "three", c: 0.75}, {token: "ten", c: 0.62}],
+    objects:  [{token: "number", c: 0.74}, {token: "count", c: 0.70}, {token: "many", c: 0.55}],
+  },
+  {
+    layer: 2, feat: 2, name: "concept-motion",
+    subjects: [{token: "run", c: 0.80}, {token: "jump", c: 0.72}, {token: "walk", c: 0.65}],
+    objects:  [{token: "action", c: 0.76}, {token: "motion", c: 0.71}, {token: "movement", c: 0.59}],
+  },
+];
+
+// Token embeddings (input residual at layer 0)
+const TOKENS = {
+  cat:   [ 0.9, -0.1,  0.0,  0.0],
+  dog:   [-0.2,  0.9,  0.1,  0.0],
+  seven: [ 0.0,  0.0,  0.9,  0.2],
+  run:   [ 0.1,  0.0, -0.1,  0.9],
+};
+
+// ----- helpers -----
+const dot = (a, b) => a.reduce((s, x, i) => s + x * b[i], 0);
+const silu = (x) => x / (1 + Math.exp(-x));
+const fmt = (v) => (v >= 0 ? " " : "") + (+v).toFixed(2);
+
+function buildMatrix(elId, data, gridCols) {
+  const el = document.getElementById(elId);
+  el.innerHTML = "";
+  el.style.gridTemplateColumns = `repeat(${gridCols}, 44px)`;
+  for (const row of data) {
+    for (const v of row) {
+      const c = document.createElement("div");
+      c.className = "cell";
+      c.textContent = fmt(v);
+      el.appendChild(c);
+    }
+  }
+}
+
+// ----- Step 1: render layer matrices -----
+// Shows all three matrices (W_gate, W_up, W_down) per layer. W_down is
+// rendered in feature-major orientation — the form LARQL stores in
+// down_features.bin, where row i = feature i. (In raw safetensors W_down
+// is transposed; feature i is the i-th column. See Step 2 for that detail.)
+function renderLayersStack() {
+  const wrap = document.getElementById("layers-stack");
+  wrap.innerHTML = "";
+  LAYERS.forEach((layer, idx) => {
+    const block = document.createElement("div");
+    block.style.marginBottom = "16px";
+    block.innerHTML = `
+      <div style="font-weight:600;font-size:14px;margin-bottom:8px;color:#374151">
+        ${layer.name} <span style="color:#888;font-weight:400">— ${layer.role}</span>
+      </div>
+      <div class="matrix-row">
+        <div class="matrix-block">
+          <div class="matrix-label">W_gate <span class="matrix-sub">[4 × 4] — keys for KNN</span></div>
+          <div style="display:flex">
+            <div class="feature-tags">
+              ${layer.features.map(f => `<div class="row-tag">${f.name} →</div>`).join("")}
+            </div>
+            <div class="matrix gate-color" id="m-gate-${idx}"></div>
+          </div>
+        </div>
+        <div class="matrix-block">
+          <div class="matrix-label">W_up <span class="matrix-sub">[4 × 4] — gain</span></div>
+          <div class="matrix up-color" id="m-up-${idx}"></div>
+        </div>
+        <div class="matrix-block">
+          <div class="matrix-label">W_down <span class="matrix-sub">[4 × 4] — feature-major</span></div>
+          <div class="matrix down-color" id="m-down-${idx}"></div>
+        </div>
+      </div>
+    `;
+    wrap.appendChild(block);
+    buildMatrix(`m-gate-${idx}`, layer.features.map(f => f.key), 4);
+    buildMatrix(`m-up-${idx}`,   layer.features.map(f => f.up),   4);
+    buildMatrix(`m-down-${idx}`, layer.features.map(f => f.value), 4);
+    if (idx < LAYERS.length - 1) {
+      const arrow = document.createElement("div");
+      arrow.className = "arrow-down";
+      arrow.textContent = "↓ residual stream (with attention sub-block in between, omitted from this toy)";
+      wrap.appendChild(arrow);
+    }
+  });
+  // Footnote
+  const note = document.createElement("div");
+  note.style.cssText = "font-size:12px;color:#666;font-style:italic;margin-top:8px;padding:8px 12px;background:#f8fafc;border-left:3px solid #cbd5e1;border-radius:4px;";
+  note.innerHTML = "Note: real Gemma-3 4B has 34 layers and 10,240 features each (so each matrix is [10240, 2560] or [2560, 10240]). Per <code>docs/findings.md</code> §2 the layers form four phases — passive (L0–L6), active (L7–L18), knowledge (L19–L29, peak at L26–L27 where the canonical <code>(France, L26-F9298, Paris)</code> edge lives), and format gate (L30–L33). The toy compresses each phase into one layer. ~85% of features have no clean human-readable interpretation; the named features here are a teaching device.";
+  wrap.appendChild(note);
+}
+
+// ----- Step 2/3/4: graph rendering -----
+const NODE_R = 22;
+const COL_X = [135, 405, 675, 945];   // x positions per layer (4 layers)
+const ROW_Y = [70, 150, 230, 310];
+
+function nodePos(layerIdx, featIdx) {
+  return { x: COL_X[layerIdx], y: ROW_Y[featIdx] };
+}
+
+function clearSVG(svg) { while (svg.firstChild) svg.removeChild(svg.firstChild); }
+
+function drawNodes(svg, opts = {}) {
+  // Layer labels
+  LAYERS.forEach((layer, idx) => {
+    const t = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    t.setAttribute("class", "layer-label");
+    t.setAttribute("x", COL_X[idx]);
+    t.setAttribute("y", 30);
+    t.textContent = layer.name;
+    svg.appendChild(t);
+    const t2 = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    t2.setAttribute("class", "layer-label");
+    t2.setAttribute("x", COL_X[idx]);
+    t2.setAttribute("y", 48);
+    t2.style.fontSize = "10px";
+    t2.style.fontStyle = "italic";
+    t2.style.fill = "#888";
+    t2.textContent = layer.role;
+    svg.appendChild(t2);
+  });
+  // Nodes
+  LAYERS.forEach((layer, lIdx) => {
+    layer.features.forEach((feat, fIdx) => {
+      const { x, y } = nodePos(lIdx, fIdx);
+      const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+      g.setAttribute("class", "node");
+      g.setAttribute("data-layer", lIdx);
+      g.setAttribute("data-feat", fIdx);
+      const c = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+      c.setAttribute("cx", x); c.setAttribute("cy", y); c.setAttribute("r", NODE_R);
+      g.appendChild(c);
+      const txt = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      txt.setAttribute("x", x); txt.setAttribute("y", y + 4);
+      txt.textContent = `${lIdx}.${fIdx}`;
+      g.appendChild(txt);
+      const lbl = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      lbl.setAttribute("class", "node-label");
+      lbl.setAttribute("x", x); lbl.setAttribute("y", y + NODE_R + 14);
+      lbl.textContent = feat.name;
+      g.appendChild(lbl);
+      svg.appendChild(g);
+    });
+  });
+}
+
+function drawEdges(svg, threshold = 0.15) {
+  // Compute all candidate edges between adjacent layers
+  const edges = [];
+  for (let L = 0; L < LAYERS.length - 1; L++) {
+    LAYERS[L].features.forEach((src, i) => {
+      LAYERS[L+1].features.forEach((dst, j) => {
+        const w = dot(src.value, dst.key);
+        if (Math.abs(w) > threshold) edges.push({ L, i, j, w });
+      });
+    });
+  }
+  // Draw — bezier curves
+  edges.forEach(({ L, i, j, w }) => {
+    const a = nodePos(L, i);
+    const b = nodePos(L+1, j);
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    const midX = (a.x + b.x) / 2;
+    path.setAttribute("d", `M ${a.x + NODE_R} ${a.y} C ${midX} ${a.y}, ${midX} ${b.y}, ${b.x - NODE_R} ${b.y}`);
+    path.setAttribute("class", "edge " + (Math.abs(w) > 0.3 ? "strong" : "weak"));
+    path.setAttribute("data-edge", `${L}-${i}-${j}`);
+    svg.appendChild(path);
+  });
+  return edges;
+}
+
+// Move nodes to the front (after edges)
+function bringNodesToFront(svg) {
+  const nodes = Array.from(svg.querySelectorAll(".node"));
+  nodes.forEach(n => svg.appendChild(n));
+}
+
+// ----- Render Step 2 (nodes only) -----
+function renderNodesOnly() {
+  const svg = document.getElementById("graph-nodes-only");
+  clearSVG(svg);
+  drawNodes(svg);
+}
+
+// ----- Render Step 3 (token → feature → token edge graph) -----
+// LARQL's actual edge schema: each FFN feature becomes a bundle of
+// (subject_token, "L{layer}-F{feature}", object_token) edges, where the
+// subject/object tokens are found by KNN of the feature's gate / down
+// vectors against the vocabulary embedding matrix.
+function renderWithEdges() {
+  const svg = document.getElementById("graph-with-edges");
+  clearSVG(svg);
+
+  const NS = "http://www.w3.org/2000/svg";
+
+  // Layout: three columns inside a 1080-wide SVG. 90px left/right margins,
+  // matched 240px gaps between columns.
+  const SUB_X = 90, FEAT_X = 450, OBJ_X = 870;
+  const TOK_W = 120, TOK_H = 30;
+  const FEAT_W = 180, FEAT_H = 56;
+
+  // Column headers
+  function header(x, text, color) {
+    const t = document.createElementNS(NS, "text");
+    t.setAttribute("x", x); t.setAttribute("y", 28);
+    t.setAttribute("class", "layer-label");
+    t.style.fontSize = "13px";
+    t.style.fill = color;
+    t.textContent = text;
+    svg.appendChild(t);
+  }
+  header(SUB_X + TOK_W / 2, "subject tokens", "#15803d");
+  header(FEAT_X + FEAT_W / 2, "feature (the edge label)", "#2563eb");
+  header(OBJ_X + TOK_W / 2, "object tokens", "#7c3aed");
+
+  // Column subtitles
+  function subhead(x, text) {
+    const t = document.createElementNS(NS, "text");
+    t.setAttribute("x", x); t.setAttribute("y", 46);
+    t.setAttribute("class", "layer-label");
+    t.style.fontSize = "10px";
+    t.style.fontStyle = "italic";
+    t.style.fill = "#888";
+    t.textContent = text;
+    svg.appendChild(t);
+  }
+  subhead(SUB_X + TOK_W / 2, "KNN of gate vector");
+  subhead(OBJ_X + TOK_W / 2, "KNN of down vector");
+
+  // Vertical positioning for each feature row
+  const ROW_H = 150;
+  const ROW_TOP = 80;
+
+  // Draw token rectangle helper
+  function tokenBox(x, y, label, fill, border, color) {
+    const r = document.createElementNS(NS, "rect");
+    r.setAttribute("x", x); r.setAttribute("y", y);
+    r.setAttribute("width", TOK_W); r.setAttribute("height", TOK_H);
+    r.setAttribute("rx", 6); r.setAttribute("ry", 6);
+    r.setAttribute("fill", fill); r.setAttribute("stroke", border);
+    r.setAttribute("stroke-width", 1.5);
+    svg.appendChild(r);
+    const t = document.createElementNS(NS, "text");
+    t.setAttribute("x", x + TOK_W / 2);
+    t.setAttribute("y", y + TOK_H / 2 + 4);
+    t.setAttribute("text-anchor", "middle");
+    t.style.fontSize = "12px";
+    t.style.fontWeight = "600";
+    t.style.fill = color;
+    t.style.fontFamily = "ui-monospace, monospace";
+    t.textContent = label;
+    svg.appendChild(t);
+  }
+
+  // Draw each feature row
+  TOKEN_FEATURE_EDGES.forEach((edge, idx) => {
+    const cy = ROW_TOP + idx * ROW_H + 30;
+
+    // Centre feature node
+    const featY = cy + 30;
+    const r = document.createElementNS(NS, "rect");
+    r.setAttribute("x", FEAT_X); r.setAttribute("y", featY);
+    r.setAttribute("width", FEAT_W); r.setAttribute("height", FEAT_H);
+    r.setAttribute("rx", 8); r.setAttribute("ry", 8);
+    r.setAttribute("fill", "#dbeafe"); r.setAttribute("stroke", "#2563eb");
+    r.setAttribute("stroke-width", 2);
+    svg.appendChild(r);
+    const fl = document.createElementNS(NS, "text");
+    fl.setAttribute("x", FEAT_X + FEAT_W / 2);
+    fl.setAttribute("y", featY + 22);
+    fl.setAttribute("text-anchor", "middle");
+    fl.style.fontSize = "13px";
+    fl.style.fontWeight = "700";
+    fl.style.fill = "#1e3a8a";
+    fl.style.fontFamily = "ui-monospace, monospace";
+    fl.textContent = `L${edge.layer}-F${edge.feat}`;
+    svg.appendChild(fl);
+    const fl2 = document.createElementNS(NS, "text");
+    fl2.setAttribute("x", FEAT_X + FEAT_W / 2);
+    fl2.setAttribute("y", featY + 40);
+    fl2.setAttribute("text-anchor", "middle");
+    fl2.style.fontSize = "11px";
+    fl2.style.fontStyle = "italic";
+    fl2.style.fill = "#475569";
+    fl2.textContent = `“${edge.name}”`;
+    svg.appendChild(fl2);
+
+    // Subjects on the left
+    const sCount = edge.subjects.length;
+    edge.subjects.forEach((sub, i) => {
+      const sy = cy + (i - (sCount - 1) / 2) * 36;
+      tokenBox(SUB_X, sy, sub.token, "#dcfce7", "#16a34a", "#14532d");
+      // Edge from subject to feature
+      const path = document.createElementNS(NS, "path");
+      const x1 = SUB_X + TOK_W, y1 = sy + TOK_H / 2;
+      const x2 = FEAT_X, y2 = featY + FEAT_H / 2;
+      const mx = (x1 + x2) / 2;
+      path.setAttribute("d", `M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`);
+      // Stroke width by confidence
+      const w = 0.8 + sub.c * 2.4;
+      path.setAttribute("stroke", "#86efac");
+      path.setAttribute("stroke-width", w);
+      path.setAttribute("fill", "none");
+      path.setAttribute("opacity", 0.45 + sub.c * 0.5);
+      svg.appendChild(path);
+      // Confidence label near subject
+      const ct = document.createElementNS(NS, "text");
+      ct.setAttribute("x", x1 + 4); ct.setAttribute("y", y1 - 4);
+      ct.style.fontSize = "9px"; ct.style.fill = "#15803d";
+      ct.textContent = sub.c.toFixed(2);
+      svg.appendChild(ct);
+    });
+
+    // Objects on the right
+    const oCount = edge.objects.length;
+    edge.objects.forEach((obj, i) => {
+      const oy = cy + (i - (oCount - 1) / 2) * 36;
+      tokenBox(OBJ_X, oy, obj.token, "#ede9fe", "#7c3aed", "#4c1d95");
+      const path = document.createElementNS(NS, "path");
+      const x1 = FEAT_X + FEAT_W, y1 = featY + FEAT_H / 2;
+      const x2 = OBJ_X, y2 = oy + TOK_H / 2;
+      const mx = (x1 + x2) / 2;
+      path.setAttribute("d", `M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`);
+      const w = 0.8 + obj.c * 2.4;
+      path.setAttribute("stroke", "#c4b5fd");
+      path.setAttribute("stroke-width", w);
+      path.setAttribute("fill", "none");
+      path.setAttribute("opacity", 0.45 + obj.c * 0.5);
+      svg.appendChild(path);
+      const ct = document.createElementNS(NS, "text");
+      ct.setAttribute("x", x2 - 18); ct.setAttribute("y", y2 - 4);
+      ct.style.fontSize = "9px"; ct.style.fill = "#7c3aed";
+      ct.textContent = obj.c.toFixed(2);
+      svg.appendChild(ct);
+    });
+  });
+
+  // Caption: relation pattern (centred on the 1080-wide SVG)
+  const cap = document.createElementNS(NS, "text");
+  cap.setAttribute("x", 540); cap.setAttribute("y", 545);
+  cap.setAttribute("text-anchor", "middle");
+  cap.style.fontSize = "12px";
+  cap.style.fontStyle = "italic";
+  cap.style.fill = "#475569";
+  cap.textContent = "edge = (subject, “L{layer}-F{feature}”, object, confidence)";
+  svg.appendChild(cap);
+}
+
+// ----- Render Step 4 (sparse top-K walk) -----
+// Faithful to the corrected Step 4:
+//   1. score every feature by  dot(residual, gate)
+//   2. pick top-K (K = WALK_K)
+//   3. for selected, compute act = silu(gate_score) * up_score, where
+//      up_score = dot(residual, up_vec) — *distinct* from gate_score
+//   4. residual += sum_k  act_k * down_vec_k        (only fired features)
+function simulateWalk(tokenName) {
+  let residual = TOKENS[tokenName].slice();
+  const activeNodes = [];
+  const trace = [];   // per-layer trace for the explanation
+
+  LAYERS.forEach((layer, L) => {
+    // Step 1 — gate scores for ALL features
+    const gateScores = layer.features.map(f => dot(residual, f.key));
+    // Step 2 — pick top-K by gate score
+    const ranked = gateScores
+      .map((s, i) => ({ i, s }))
+      .sort((a, b) => b.s - a.s);
+    const fired = ranked.slice(0, WALK_K).map(r => r.i);
+
+    // Step 3 — compute fire strength for selected features only
+    const fireInfo = fired.map(i => {
+      const f = layer.features[i];
+      const gate = gateScores[i];
+      const up = dot(residual, f.up);
+      const act = silu(gate) * up;
+      return { i, gate, up, act };
+    });
+
+    // Step 4 — add fired features' down vectors to the residual
+    fireInfo.forEach(({ i, act }) => {
+      const f = layer.features[i];
+      activeNodes.push({ L, i, act });
+      for (let d = 0; d < 4; d++) residual[d] += act * f.value[d];
+    });
+
+    trace.push({
+      L,
+      gateScores,
+      fired,
+      fireInfo,
+      skipped: ranked.slice(WALK_K).map(r => r.i),
+    });
+  });
+
+  return { activeNodes, trace };
+}
+
+// Draw walk-path edges connecting fired features at consecutive layers.
+// These are NOT precomputed graph edges — they're the *path the activation
+// took*, materialised at runtime from the top-K choices at each layer.
+function drawWalkPath(svg, activeByLayer) {
+  for (let L = 0; L < LAYERS.length - 1; L++) {
+    const fromList = activeByLayer.get(L) || [];
+    const toList = activeByLayer.get(L + 1) || [];
+    fromList.forEach(i => {
+      toList.forEach(j => {
+        const a = nodePos(L, i);
+        const b = nodePos(L + 1, j);
+        const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+        const midX = (a.x + b.x) / 2;
+        path.setAttribute("d", `M ${a.x + NODE_R} ${a.y} C ${midX} ${a.y}, ${midX} ${b.y}, ${b.x - NODE_R} ${b.y}`);
+        path.setAttribute("class", "edge active");
+        svg.appendChild(path);
+      });
+    });
+  }
+}
+
+function renderWalk(tokenName) {
+  const svg = document.getElementById("graph-walk");
+  clearSVG(svg);
+
+  const { activeNodes, trace } = simulateWalk(tokenName);
+  const activeByLayer = new Map();
+  activeNodes.forEach(n => {
+    if (!activeByLayer.has(n.L)) activeByLayer.set(n.L, []);
+    activeByLayer.get(n.L).push(n.i);
+  });
+
+  // Walk path first (so nodes sit on top)
+  drawWalkPath(svg, activeByLayer);
+  drawNodes(svg);
+  bringNodesToFront(svg);
+
+  const activeSet = new Set(activeNodes.map(n => `${n.L}-${n.i}`));
+
+  // Highlight active nodes; dim the rest
+  svg.querySelectorAll(".node").forEach(n => {
+    const L = +n.getAttribute("data-layer");
+    const i = +n.getAttribute("data-feat");
+    if (activeSet.has(`${L}-${i}`)) n.classList.add("active");
+    else n.classList.add("dim");
+  });
+
+  // Update explanation — show the path AND the per-layer scores
+  const expl = document.getElementById("walk-explanation");
+  const pathLabels = activeNodes
+    .map(n => `<b>${LAYERS[n.L].features[n.i].name}</b>`)
+    .join(" → ");
+
+  const scoreRows = trace.map(t => {
+    const cells = t.gateScores
+      .map((s, i) => {
+        const featName = LAYERS[t.L].features[i].name;
+        const isFired = t.fired.includes(i);
+        const tag = isFired
+          ? `<span style="background:#fde68a;color:#78350f;padding:1px 5px;border-radius:3px;font-weight:600">${featName} ${s.toFixed(2)} ✓</span>`
+          : `<span style="opacity:0.55">${featName} ${s.toFixed(2)}</span>`;
+        return tag;
+      })
+      .join("&nbsp;&nbsp;");
+    return `<div style="margin:4px 0"><code>L${t.L}</code> gate scores: ${cells}</div>`;
+  }).join("");
+
+  expl.innerHTML = `
+    <b>Walk for "${tokenName}":</b> ${pathLabels}
+    <div style="margin-top:10px;font-size:13px;color:#555">
+      At each layer, every feature is scored by <code>dot(residual, gate)</code>.
+      The top-${WALK_K} fires (highlighted ✓); the rest are skipped.
+      Then <code>act = silu(gate) × up</code> sets the magnitude, and
+      <code>residual += act × down</code> writes back. <i>K = ${WALK_K} here for clarity; real Gemma-3 4B uses K ≈ 10 of 10,240 features per layer.</i>
+    </div>
+    <div style="margin-top:10px;font-size:12px;font-family:ui-monospace,monospace;background:rgba(255,255,255,0.6);padding:8px 10px;border-radius:6px">
+      ${scoreRows}
+    </div>
+  `;
+}
+
+// ----- wire up -----
+renderLayersStack();
+renderNodesOnly();
+renderWithEdges();
+renderWalk("cat");
+
+document.querySelectorAll("[data-input]").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll("[data-input]").forEach(b => b.classList.remove("active"));
+    btn.classList.add("active");
+    renderWalk(btn.dataset.input);
+  });
+});
+</script>
+</body>
+</html>

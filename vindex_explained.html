@@ -1,0 +1,711 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>LARQL — From Model Weights to a Queryable Graph</title>
+<style>
+  :root { color-scheme: light; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    max-width: 980px;
+    margin: 40px auto;
+    padding: 20px;
+    background: #fafaf7;
+    color: #222;
+    line-height: 1.65;
+  }
+  h1 { color: #2a4d8f; font-size: 2em; margin-bottom: 0.2em; }
+  h1 + p.subtitle { color: #6a6a6a; font-style: italic; margin-top: 0; font-size: 1.05em; }
+  h2 {
+    color: #2a4d8f;
+    margin-top: 56px;
+    border-bottom: 2px solid #e0d8c8;
+    padding-bottom: 8px;
+    font-size: 1.4em;
+  }
+  h3 { color: #3a5d9f; margin-top: 32px; font-size: 1.1em; }
+
+  .stage-tag {
+    display: inline-block;
+    background: #2a4d8f;
+    color: white;
+    font-size: 0.75em;
+    font-weight: 700;
+    padding: 3px 10px;
+    border-radius: 10px;
+    letter-spacing: 0.5px;
+    margin-right: 10px;
+    vertical-align: middle;
+  }
+
+  .diagram {
+    background: white;
+    border: 1px solid #d8d2c4;
+    border-radius: 12px;
+    padding: 28px;
+    margin: 20px 0;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.04);
+  }
+  .diagram.center { text-align: center; }
+
+  .box {
+    display: inline-block;
+    padding: 12px 16px;
+    border-radius: 10px;
+    margin: 6px;
+    font-weight: 600;
+    color: white;
+    min-width: 110px;
+    font-size: 0.95em;
+  }
+  .input  { background: #5b9aa0; }
+  .expand { background: #d68c45; }
+  .bend   { background: #b85450; }
+  .shrink { background: #6a994e; }
+  .meta   { background: #8a6fbf; }
+  .arrow {
+    font-size: 26px;
+    color: #888;
+    margin: 0 4px;
+    vertical-align: middle;
+  }
+
+  .note {
+    background: #fff8e1;
+    border-left: 4px solid #f0b840;
+    padding: 14px 18px;
+    margin: 18px 0;
+    border-radius: 4px;
+  }
+  .analogy {
+    background: #eaf4f0;
+    border-left: 4px solid #6a994e;
+    padding: 14px 18px;
+    margin: 18px 0;
+    border-radius: 4px;
+  }
+  .bigidea {
+    background: linear-gradient(90deg, #f4ecde, #fbf6ec);
+    border: 1px solid #d8c89a;
+    border-radius: 12px;
+    padding: 20px 26px;
+    margin: 24px 0;
+    font-size: 1.05em;
+  }
+  .bigidea strong { color: #2a4d8f; }
+
+  code {
+    background: #f0ebe0;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 0.95em;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  pre {
+    background: #f6f2e8;
+    border: 1px solid #e0d8c8;
+    border-radius: 8px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    font-size: 0.9em;
+    line-height: 1.5;
+  }
+  pre code { background: none; padding: 0; }
+
+  table { width: 100%; border-collapse: collapse; margin: 16px 0; }
+  th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid #e0d8c8; vertical-align: top; }
+  th { background: #2a4d8f; color: white; font-weight: 600; }
+
+  svg { max-width: 100%; height: auto; display: block; margin: 0 auto; }
+
+  /* Module A — node/edge explorer */
+  .layer-stack {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    justify-content: center;
+    margin: 16px 0;
+  }
+  .layer-pill {
+    width: 38px;
+    height: 28px;
+    border-radius: 6px;
+    background: #e9e3d2;
+    color: #555;
+    font-size: 0.75em;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s, transform 0.15s;
+    user-select: none;
+  }
+  .layer-pill:hover { background: #d8c89a; }
+  .layer-pill.active { background: #2a4d8f; color: white; transform: scale(1.05); }
+
+  .feature-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 10px;
+    margin: 16px 0;
+  }
+  .feature-card {
+    background: #f6f2e8;
+    border: 1px solid #e0d8c8;
+    border-radius: 8px;
+    padding: 10px 12px;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+    font-size: 0.9em;
+  }
+  .feature-card:hover { background: #fbf6ec; border-color: #d68c45; }
+  .feature-card.active { background: #fff8e1; border-color: #f0b840; }
+  .feature-card .fid { font-family: ui-monospace, monospace; color: #888; font-size: 0.8em; }
+  .feature-card .flabel { font-weight: 600; color: #2a4d8f; }
+
+  .edge-panel {
+    background: #fbf6ec;
+    border: 1px dashed #d8c89a;
+    border-radius: 8px;
+    padding: 14px 16px;
+    margin-top: 14px;
+    min-height: 80px;
+  }
+  .edge-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 0;
+    font-size: 0.92em;
+  }
+  .edge-bar {
+    height: 8px;
+    border-radius: 3px;
+    background: #6a994e;
+    flex-shrink: 0;
+  }
+  .edge-target { font-family: ui-monospace, monospace; color: #2a4d8f; font-weight: 600; }
+  .edge-weight { color: #888; font-size: 0.85em; margin-left: auto; }
+
+  /* Module C — vindex anatomy tree */
+  .tree-row {
+    display: flex;
+    gap: 0;
+    align-items: stretch;
+    margin: 16px 0;
+    background: white;
+    border: 1px solid #d8d2c4;
+    border-radius: 12px;
+    overflow: hidden;
+  }
+  .tree-list {
+    flex: 0 0 320px;
+    padding: 18px 16px;
+    background: #f6f2e8;
+    border-right: 1px solid #e0d8c8;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.88em;
+    line-height: 1.9;
+  }
+  .tree-list .file {
+    cursor: pointer;
+    padding: 2px 8px;
+    border-radius: 4px;
+    display: block;
+    color: #333;
+    transition: background 0.15s, color 0.15s;
+  }
+  .tree-list .file:hover { background: #ece4d0; }
+  .tree-list .file.active { background: #2a4d8f; color: white; }
+  .tree-list .dim { color: #999; }
+  .tree-list .indent { display: inline-block; width: 20px; }
+
+  .tree-detail {
+    flex: 1;
+    padding: 22px 26px;
+  }
+  .tree-detail h4 {
+    margin: 0 0 6px;
+    color: #2a4d8f;
+    font-family: ui-monospace, monospace;
+  }
+  .tree-detail .role {
+    display: inline-block;
+    background: #eaf4f0;
+    color: #3d6e36;
+    font-size: 0.75em;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 6px;
+    margin-bottom: 10px;
+  }
+  .tree-detail .role.optional { background: #f4ecde; color: #8a6028; }
+
+  .level-pills {
+    display: flex;
+    gap: 6px;
+    margin-top: 8px;
+  }
+  .level-pill {
+    font-size: 0.75em;
+    padding: 2px 8px;
+    border-radius: 10px;
+    background: #e9e3d2;
+    color: #888;
+    font-weight: 600;
+  }
+  .level-pill.on { background: #2a4d8f; color: white; }
+
+  /* Module D — patch flipbook */
+  .flip {
+    display: grid;
+    grid-template-columns: 1fr 40px 1fr 40px 1fr;
+    align-items: stretch;
+    gap: 0;
+    margin: 20px 0;
+  }
+  .flip-frame {
+    background: white;
+    border: 1px solid #d8d2c4;
+    border-radius: 12px;
+    padding: 18px;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.04);
+  }
+  .flip-frame h4 { margin: 0 0 10px; color: #2a4d8f; font-size: 1em; }
+  .flip-arrow {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #888;
+    font-size: 24px;
+  }
+  .file-chip {
+    display: block;
+    background: #f6f2e8;
+    border: 1px solid #e0d8c8;
+    border-radius: 6px;
+    padding: 6px 10px;
+    margin: 4px 0;
+    font-family: ui-monospace, monospace;
+    font-size: 0.82em;
+    color: #444;
+  }
+  .file-chip.locked { background: #ece4d0; color: #666; }
+  .file-chip.locked::before { content: "🔒 "; }
+  .file-chip.linked { border-style: dashed; color: #3d6e36; background: #eaf4f0; }
+  .file-chip.linked::before { content: "↪ "; }
+  .file-chip.new { background: #fff8e1; border-color: #f0b840; color: #8a6028; }
+  .file-chip.new::before { content: "★ "; }
+  .file-chip.patch { background: #f4ecde; border-color: #d68c45; color: #8a6028; }
+  .file-chip.patch::before { content: "+ "; }
+
+  /* glossary */
+  .glossary { columns: 2; column-gap: 32px; }
+  .glossary dt { font-weight: 700; color: #2a4d8f; margin-top: 10px; font-family: ui-monospace, monospace; font-size: 0.95em; }
+  .glossary dd { margin: 2px 0 8px 0; font-size: 0.94em; }
+
+  @media (max-width: 760px) {
+    .tree-row { flex-direction: column; }
+    .tree-list { flex: none; border-right: none; border-bottom: 1px solid #e0d8c8; }
+    .flip { grid-template-columns: 1fr; }
+    .flip-arrow { transform: rotate(90deg); padding: 8px; }
+    .glossary { columns: 1; }
+  }
+</style>
+</head>
+<body>
+
+<h1>LARQL — From Model Weights to a Queryable Graph</h1>
+<p class="subtitle">A first-time-user's tour of how a transformer becomes a database, how that database is queried, and how edits get baked back into a model.</p>
+
+<div class="bigidea">
+  <strong>The one big idea.</strong> A transformer is already a giant tangle of numbers — billions of weights inside W<sub>gate</sub>, W<sub>up</sub>, W<sub>down</sub>. LARQL's claim is that those numbers <em>already form a graph</em>. Each row of W<sub>gate</sub> behaves like a <strong>node</strong> ("this is the concept of <em>capital city</em>"), and the matching column of W<sub>down</sub> is what that concept <strong>writes back</strong> into the model — the outgoing <strong>edge</strong>. <em>Extract</em> doesn't change the model. It just files the same numbers onto disk in a layout you can query, walk, and edit. <em>Compile</em> bakes those edits back into a fresh standalone model.
+</div>
+
+<h2><span class="stage-tag">Stage 1</span>A model is just stacks of matrices</h2>
+
+<p>Every transformer block has the same skeleton. The part LARQL cares about is the feed-forward (FFN) sub-block, which is three matrices: <code>W_gate</code>, <code>W_up</code>, and <code>W_down</code>. For a 4B-param model like Gemma 3, each matrix is roughly <strong>2,560 × 10,240</strong> floats per layer × 34 layers.</p>
+
+<div class="diagram center">
+  <div class="box input">hidden state<br><small>2,560 nums</small></div>
+  <span class="arrow">→</span>
+  <div class="box expand">W_gate · x<br><small>10,240 nums</small></div>
+  <span class="arrow">·</span>
+  <div class="box expand">W_up · x<br><small>10,240 nums</small></div>
+  <span class="arrow">→</span>
+  <div class="box bend">SiLU<br>·<br><small>GEGLU</small></div>
+  <span class="arrow">→</span>
+  <div class="box shrink">W_down · a<br><small>2,560 nums</small></div>
+  <p style="margin-top: 22px; color: #555;">One token in, one token out. Same recipe runs for every token, every layer.</p>
+</div>
+
+<p>That's it. The model is — quite literally — files of floating-point numbers on disk. A <code>safetensors</code> file is a labelled tarball of those matrices. LARQL's first move is to look at this and ask: <em>what if these matrices were already a graph?</em></p>
+
+<h2><span class="stage-tag">Stage 2</span>Hidden inside the matrices is a graph</h2>
+
+<p>Here is the trick that makes everything else click. Look at one row of <code>W_gate</code> at one layer. It is a vector of 2,560 numbers. When the model runs, the dot product <code>x · gate_row</code> answers a single question: <em>"how strongly does this hidden state look like the pattern this row encodes?"</em></p>
+
+<p>If the answer is "strongly," the matching <em>column</em> of <code>W_down</code> at that layer gets added back into the residual stream. So each FFN feature is a tiny <strong>if/then</strong>:</p>
+
+<div class="diagram">
+  <pre><code>if   x · gate_row[i]   is high     ←  the &quot;node&quot; — what to listen for
+then add  down_col[i] · activation ←  the &quot;edge&quot; — what to write back</code></pre>
+</div>
+
+<p>In a 4B model with 34 layers and 10,240 features per layer, that is roughly <strong>348,160 nodes</strong> and far more edges (since each node connects to many tokens through its down-column). LARQL labels each node with a <code>feature_meta</code> entry — a guess at what the feature actually represents, derived by looking at which tokens its down-column most amplifies.</p>
+
+<h3>Try it: pick a layer, pick a feature, see its edges</h3>
+
+<div class="diagram">
+  <p style="margin: 0 0 8px; color: #555; font-size: 0.95em;"><strong>Layer:</strong> click any layer of the FFN stack to see a sample of its features.</p>
+  <div class="layer-stack" id="layer-stack"></div>
+  <p style="margin: 14px 0 8px; color: #555; font-size: 0.95em;"><strong>Features in this layer (sample of 12):</strong> click one to reveal its top edges.</p>
+  <div class="feature-grid" id="feature-grid"></div>
+  <div class="edge-panel" id="edge-panel">
+    <em style="color: #999;">Pick a feature above to see its outgoing edges — the tokens its <code>down_col</code> most amplifies when the gate fires.</em>
+  </div>
+</div>
+
+<div class="note">
+  <strong>How does LARQL decide what's a node and what's an edge?</strong> It doesn't — the model already did. Every gate-row / down-column pair in every FFN layer is a node-with-an-edge-payload. LARQL's job is to <em>file</em> them so they can be looked up by name, by neighborhood, or by token, instead of being hidden inside a matmul.
+</div>
+
+<h2><span class="stage-tag">Stage 3</span>Extract files the graph onto disk</h2>
+
+<p><code>larql extract-index</code> reads the model's <code>safetensors</code> and writes a <strong>vindex</strong> — a directory of memory-mappable binary files. No forward passes, no GPU, no fine-tuning. Just careful copying and re-layout.</p>
+
+<p>There are three <strong>extraction levels</strong>, each pulling out a bit more of the model:</p>
+
+<table>
+  <tr><th style="width:18%">Level</th><th style="width:22%">Disk (Gemma-3 4B, f16)</th><th>What it unlocks</th></tr>
+  <tr><td><code>browse</code></td><td>~3 GB</td><td><code>DESCRIBE</code>, <code>WALK</code>, <code>SELECT</code> — explore the graph structure</td></tr>
+  <tr><td><code>inference</code></td><td>~6 GB</td><td>+ <code>INFER</code> — run forward passes against the vindex's FFN</td></tr>
+  <tr><td><code>all</code></td><td>~10 GB</td><td>+ <code>COMPILE</code> — bake patches into a standalone vindex</td></tr>
+</table>
+
+<h3>Anatomy of a vindex</h3>
+
+<p>Click any file in the tree to see what it stores and which LQL verbs it powers.</p>
+
+<div class="tree-row">
+  <div class="tree-list" id="tree-list"></div>
+  <div class="tree-detail" id="tree-detail"></div>
+</div>
+
+<div class="analogy">
+  <strong>The library analogy.</strong> A <code>safetensors</code> file is a single very long scroll: you can read it cover to cover, but you can't ask it "what's near <em>Mozart</em>?" A vindex is the same scroll, transcribed onto labelled cards in labelled drawers. <code>gate_vectors.bin</code> is the card catalog (concepts), <code>down_features.bin</code> is what each card writes when it fires, <code>feature_meta.bin</code> is the human-readable label on the card. Nothing was added or removed — just sorted.
+</div>
+
+<h2><span class="stage-tag">Stage 4</span>Query it like a database</h2>
+
+<p>Once a vindex exists, LQL (Lazarus Query Language) lets you talk to it like SQL talks to a relational database. Same data, three different lenses:</p>
+
+<div class="diagram">
+<pre><code>USE "output/gemma3-4b.vindex";
+
+DESCRIBE "France";
+-- "France" → entity feature L18:f7234, neighbors: Paris, French, Europe…
+-- This is a graph lookup. No forward pass. ~5ms.
+
+WALK "The capital of France is" TOP 10;
+-- Token-by-token walk: at each layer, K=10 gate features fire, their
+-- down-cols are summed into the residual. This IS a forward pass — but
+-- it reads only the K features it needs from mmap, not the whole matrix.
+-- Walk is faster than dense (517ms vs 535ms on Gemma 4B).
+
+INFER "The capital of France is" TOP 5;
+-- Full inference, returns top-5 next tokens with probabilities.
+-- → "Paris" (0.87), "the" (0.04), "a" (0.02)…</code></pre>
+</div>
+
+<div class="note">
+  <strong>Why <em>walk</em> can beat <em>dense</em>.</strong> A dense FFN multiplies the activation against the entire <code>W_down</code> matrix. The walk picks the K≈10 gate features that fired hardest and reads only those K columns from the memory-mapped <code>down_features.bin</code>. Same answer, less memory bandwidth, better cache behavior. The graph layout <em>is</em> the optimization.
+</div>
+
+<h2><span class="stage-tag">Stage 5</span>Edit it like a graph (but never overwrite)</h2>
+
+<p>The base vindex is <strong>read-only</strong>. Edits are stored as a <strong>patch</strong>, a small JSON file (<code>.vlp</code>) that overlays the base. <code>INSERT</code>, <code>DELETE</code>, and <code>UPDATE</code> auto-start a patch in memory; <code>SAVE PATCH "name.vlp"</code> writes it to disk.</p>
+
+<div class="diagram">
+<pre><code>USE "gemma3-4b.vindex";
+
+INSERT EDGE "Mozart" -> "Composer" WEIGHT 0.85;
+-- A new gate_row at the chosen layer + a new down_col, kept in the patch.
+-- The base files on disk are still untouched.
+
+DELETE EDGE "Pluto" -> "Planet";
+-- Records a tombstone in the patch. The base entry is hidden, not erased.
+
+SAVE PATCH "my_edits.vlp";
+-- Persists the overlay. Base vindex is still readable by anyone else.</code></pre>
+</div>
+
+<div class="analogy">
+  <strong>The acetate-overlay analogy.</strong> A patch is like the transparent acetate sheets old biology textbooks used — slip one over the page and a new layer of organs appears on top of the same body. Slip it off and the page is unchanged. Multiple acetates can stack. The base vindex is the printed page; <code>.vlp</code> patches are the overlays.
+</div>
+
+<h2><span class="stage-tag">Stage 6</span>Compile bakes a patch back into a model</h2>
+
+<p>Patches are great for experimenting, but at some point you want a self-contained model with the edits already inside. That is what <code>COMPILE CURRENT INTO VINDEX "new.vindex"</code> does: it produces a fresh vindex where the patch has been folded into the weight files, with no overlay needed.</p>
+
+<p>The clever part is what <em>doesn't</em> get rewritten:</p>
+
+<div class="flip">
+  <div class="flip-frame">
+    <h4>Base vindex (read-only)</h4>
+    <span class="file-chip locked">gate_vectors.bin</span>
+    <span class="file-chip locked">down_features.bin</span>
+    <span class="file-chip locked">up_features.bin</span>
+    <span class="file-chip locked">feature_meta.bin</span>
+    <span class="file-chip locked">manifest.json</span>
+  </div>
+  <div class="flip-arrow">→</div>
+  <div class="flip-frame">
+    <h4>+ patch overlay (in memory)</h4>
+    <span class="file-chip locked">gate_vectors.bin</span>
+    <span class="file-chip locked">down_features.bin</span>
+    <span class="file-chip locked">up_features.bin</span>
+    <span class="file-chip locked">feature_meta.bin</span>
+    <span class="file-chip patch">my_edits.vlp</span>
+    <small style="color:#888; display:block; margin-top:8px;">queries see base ⊕ patch</small>
+  </div>
+  <div class="flip-arrow">→</div>
+  <div class="flip-frame">
+    <h4>Compiled new vindex</h4>
+    <span class="file-chip linked">gate_vectors.bin</span>
+    <span class="file-chip new">down_features.bin</span>
+    <span class="file-chip linked">up_features.bin</span>
+    <span class="file-chip linked">feature_meta.bin</span>
+    <span class="file-chip new">manifest.json</span>
+    <small style="color:#888; display:block; margin-top:8px;">↪ hardlinked · ★ rewritten</small>
+  </div>
+</div>
+
+<p>Only the file that actually changed — <code>down_features.bin</code> — gets rewritten, column-by-column. Everything else is <strong>hardlinked</strong> to the base (an APFS / ext4 trick: same bytes on disk, two directory entries). A 10 GB vindex compiles in seconds, not minutes, even on a laptop.</p>
+
+<div class="note">
+  <strong>The payoff.</strong> The compiled vindex is itself a vindex — same shape, no patch needed at load time. It can be loaded, queried, served via <code>larql serve</code>, or fed back into the next round of edits. The <code>install_edge</code> primitive that stamps a patched edge into <code>gate</code>/<code>up</code>/<code>down</code> tensors lives at <code>crates/larql-cli/src/commands/extraction/compile_cmd/edge.rs</code> — the lowest-level step of the COMPILE verb.
+</div>
+
+<h2>Putting it all together</h2>
+
+<div class="diagram center">
+  <div class="box input">model.safetensors</div>
+  <span class="arrow">→</span>
+  <div class="box expand">extract</div>
+  <span class="arrow">→</span>
+  <div class="box meta">.vindex/<br><small>graph + database</small></div>
+  <span class="arrow">→</span>
+  <div class="box bend">query<br><small>DESCRIBE / WALK / INFER</small></div>
+  <span class="arrow">→</span>
+  <div class="box shrink">edit<br><small>.vlp patch</small></div>
+  <span class="arrow">→</span>
+  <div class="box expand">COMPILE</div>
+  <span class="arrow">→</span>
+  <div class="box meta">new.vindex/</div>
+  <p style="margin-top: 22px; color: #555;">No fine-tuning. No GPU passes. The model is the database; the edits are structural; the compile is a hardlink and a rewrite.</p>
+</div>
+
+<h2>Glossary</h2>
+
+<dl class="glossary">
+  <dt>vindex</dt>
+  <dd>A directory of memory-mapped files holding the graph form of a transformer's FFN layers.</dd>
+
+  <dt>gate vector</dt>
+  <dd>A single row of W<sub>gate</sub>. Behaves like a <em>node</em>: a pattern the layer listens for.</dd>
+
+  <dt>down feature</dt>
+  <dd>The matching column of W<sub>down</sub>. The <em>edge payload</em>: what gets written when the gate fires.</dd>
+
+  <dt>feature_meta</dt>
+  <dd>A best-guess human label for each gate/down pair (e.g. <code>entity:France</code>).</dd>
+
+  <dt>extraction level</dt>
+  <dd><code>browse</code> / <code>inference</code> / <code>all</code> — gates which LQL verbs are usable.</dd>
+
+  <dt>LQL</dt>
+  <dd>Lazarus Query Language — SQL-shaped surface for browsing, mutating, and recompiling a vindex.</dd>
+
+  <dt>patch (.vlp)</dt>
+  <dd>A JSON overlay carrying INSERTs / DELETEs / UPDATEs. Stacks on top of a read-only base.</dd>
+
+  <dt>walk</dt>
+  <dd>Sparse forward pass: K≈10 gate features fire per layer, only those K down-columns are read from mmap.</dd>
+
+  <dt>compile</dt>
+  <dd>Bake a patch into a fresh standalone vindex. Hardlinks unchanged files; rewrites only what changed.</dd>
+
+  <dt>install_edge</dt>
+  <dd>Lowest-level primitive that stamps a compiled edge into the gate / up / down tensors of the new vindex.</dd>
+</dl>
+
+<p style="text-align:center; color:#999; font-size:0.85em; margin-top:48px;">
+A first-time-user walkthrough of the LARQL pipeline. For the full specs, see <code>docs/specs/lql-spec.md</code>, <code>docs/specs/vindex-format-spec.md</code>, and <code>docs/specs/vindex-operations-spec.md</code>.
+</p>
+
+<script>
+// =====================================================================
+// Module A — node/edge explorer
+// =====================================================================
+const NUM_LAYERS = 34;
+const SAMPLE_FEATURES = {
+  // Hand-curated illustrative samples per layer band.
+  // Real vindexes have ~10,240 features per layer; we show 12 per layer.
+  early: [
+    {id:"f0142", label:"token:'the'",       edges:[["the",0.94],["a",0.41],["this",0.22],["that",0.18],["these",0.12]]},
+    {id:"f0317", label:"syntax:plural",     edges:[["s",0.88],["es",0.62],["ies",0.30],["en",0.11],["i",0.09]]},
+    {id:"f0488", label:"morpheme:-ing",     edges:[["ing",0.91],["running",0.55],["walking",0.49],["doing",0.44],["being",0.41]]},
+    {id:"f0612", label:"punct:.",           edges:[[".",0.97],["!",0.31],["?",0.27],[",",0.18],[";",0.12]]},
+    {id:"f0789", label:"case:capital-1st",  edges:[["The",0.81],["A",0.55],["This",0.42],["I",0.36],["When",0.28]]},
+    {id:"f0901", label:"digit:0-9",         edges:[["0",0.90],["1",0.86],["2",0.82],["3",0.78],["9",0.71]]},
+    {id:"f1023", label:"whitespace",        edges:[[" ",0.96],["\\n",0.41],["\\t",0.22],[" ",0.18],["",0.10]]},
+    {id:"f1156", label:"token:'of'",        edges:[["of",0.93],["from",0.39],["by",0.27],["in",0.22],["with",0.18]]},
+    {id:"f1289", label:"syntax:past-tense", edges:[["ed",0.85],["was",0.62],["were",0.55],["had",0.41],["did",0.34]]},
+    {id:"f1412", label:"token:'and'",       edges:[["and",0.94],["or",0.42],["but",0.31],["plus",0.18],["nor",0.09]]},
+    {id:"f1567", label:"morpheme:un-",      edges:[["un",0.86],["unhappy",0.51],["unsure",0.44],["unable",0.41],["undo",0.36]]},
+    {id:"f1701", label:"quote:open",        edges:[["\"",0.92],["'",0.81],["“",0.61],["‘",0.42],["«",0.18]]},
+  ],
+  mid: [
+    {id:"f2104", label:"entity:France",      edges:[["Paris",0.81],["French",0.74],["Europe",0.52],["Macron",0.41],["Lyon",0.38]]},
+    {id:"f2356", label:"entity:Mozart",      edges:[["composer",0.79],["Vienna",0.62],["Salzburg",0.51],["symphony",0.44],["Austrian",0.39]]},
+    {id:"f2671", label:"role:capital-of",    edges:[["capital",0.88],["city",0.61],["seat",0.42],["headquarters",0.34],["base",0.21]]},
+    {id:"f2902", label:"relation:located-in",edges:[["in",0.74],["within",0.55],["inside",0.41],["at",0.38],["on",0.22]]},
+    {id:"f3015", label:"entity:Japan",       edges:[["Tokyo",0.83],["Japanese",0.71],["Asia",0.49],["yen",0.41],["sushi",0.31]]},
+    {id:"f3188", label:"profession:scientist",edges:[["scientist",0.78],["physicist",0.61],["chemist",0.55],["biologist",0.49],["researcher",0.44]]},
+    {id:"f3322", label:"era:19th-century",   edges:[["1800s",0.71],["Victorian",0.61],["industrial",0.49],["era",0.41],["century",0.38]]},
+    {id:"f3491", label:"entity:Einstein",    edges:[["physicist",0.84],["relativity",0.79],["German",0.51],["1879",0.41],["Princeton",0.34]]},
+    {id:"f3612", label:"animal:mammal",      edges:[["dog",0.71],["cat",0.69],["mammal",0.66],["whale",0.55],["bear",0.51]]},
+    {id:"f3784", label:"color:warm",         edges:[["red",0.81],["orange",0.74],["yellow",0.66],["pink",0.41],["amber",0.34]]},
+    {id:"f3901", label:"sentiment:positive", edges:[["good",0.79],["great",0.71],["excellent",0.66],["love",0.61],["happy",0.55]]},
+    {id:"f4012", label:"genre:music",        edges:[["song",0.81],["album",0.74],["band",0.66],["concert",0.49],["melody",0.42]]},
+  ],
+  late: [
+    {id:"f5104", label:"answer:short-fact",  edges:[["Paris",0.71],["1945",0.61],["Mozart",0.55],["Einstein",0.49],["Tokyo",0.44]]},
+    {id:"f5311", label:"format:list-item",   edges:[["1.",0.81],["•",0.61],["-",0.55],["2.",0.49],["a)",0.41]]},
+    {id:"f5489", label:"discourse:conclude", edges:[["therefore",0.81],["thus",0.71],["finally",0.61],["so",0.49],["hence",0.41]]},
+    {id:"f5612", label:"vocab:formal",       edges:[["consequently",0.71],["moreover",0.66],["furthermore",0.61],["whereas",0.49],["albeit",0.41]]},
+    {id:"f5789", label:"answer:yes-no",      edges:[["yes",0.81],["no",0.78],["yeah",0.41],["nope",0.34],["indeed",0.22]]},
+    {id:"f5901", label:"refusal:soft",       edges:[["sorry",0.71],["unfortunately",0.61],["cannot",0.55],["unable",0.49],["regret",0.41]]},
+    {id:"f6044", label:"closing:greeting",   edges:[["regards",0.71],["sincerely",0.66],["best",0.55],["thanks",0.49],["cheers",0.41]]},
+    {id:"f6189", label:"answer:numeric",     edges:[["42",0.61],["100",0.55],["1",0.49],["3.14",0.44],["1000",0.38]]},
+    {id:"f6322", label:"hedge:uncertain",    edges:[["maybe",0.71],["perhaps",0.66],["likely",0.61],["possibly",0.55],["might",0.49]]},
+    {id:"f6491", label:"format:code-block",  edges:[["```",0.81],["python",0.61],["function",0.49],["return",0.41],["def",0.38]]},
+    {id:"f6612", label:"register:casual",    edges:[["yeah",0.71],["gonna",0.66],["wanna",0.61],["kinda",0.49],["lol",0.41]]},
+    {id:"f6789", label:"emotion:reassure",   edges:[["okay",0.71],["fine",0.61],["alright",0.55],["safe",0.49],["calm",0.41]]},
+  ],
+};
+
+const layerStack = document.getElementById("layer-stack");
+const featureGrid = document.getElementById("feature-grid");
+const edgePanel = document.getElementById("edge-panel");
+
+function bandFor(layer) {
+  if (layer < 12) return "early";
+  if (layer < 24) return "mid";
+  return "late";
+}
+
+let activeLayer = 18;
+let activeFeatureIdx = null;
+
+function renderFeatures() {
+  const features = SAMPLE_FEATURES[bandFor(activeLayer)];
+  featureGrid.innerHTML = "";
+  features.forEach((f, idx) => {
+    const card = document.createElement("div");
+    card.className = "feature-card" + (idx === activeFeatureIdx ? " active" : "");
+    card.innerHTML = `<div class="fid">L${activeLayer}:${f.id}</div><div class="flabel">${f.label}</div>`;
+    card.onclick = () => {
+      activeFeatureIdx = idx;
+      renderFeatures();
+      renderEdges(f);
+    };
+    featureGrid.appendChild(card);
+  });
+}
+
+function renderEdges(f) {
+  const max = f.edges[0][1];
+  const rows = f.edges.map(([tok, w]) => {
+    const width = Math.round((w / max) * 240);
+    return `<div class="edge-row">
+              <span class="edge-target">${tok.replace(/</g,"&lt;")}</span>
+              <span class="edge-bar" style="width:${width}px;"></span>
+              <span class="edge-weight">${w.toFixed(2)}</span>
+            </div>`;
+  }).join("");
+  edgePanel.innerHTML = `
+    <div style="font-size:0.9em; color:#555; margin-bottom:8px;">
+      When <code>L${activeLayer}:${f.id}</code> (<strong>${f.label}</strong>) fires, its <code>down_col</code> most amplifies these tokens — these are its outgoing edges:
+    </div>
+    ${rows}
+  `;
+}
+
+for (let i = 0; i < NUM_LAYERS; i++) {
+  const pill = document.createElement("div");
+  pill.className = "layer-pill" + (i === activeLayer ? " active" : "");
+  pill.textContent = "L" + i;
+  pill.onclick = () => {
+    activeLayer = i;
+    activeFeatureIdx = null;
+    document.querySelectorAll(".layer-pill").forEach((p, idx) => {
+      p.classList.toggle("active", idx === i);
+    });
+    edgePanel.innerHTML = '<em style="color:#999;">Pick a feature above to see its outgoing edges — the tokens its <code>down_col</code> most amplifies when the gate fires.</em>';
+    renderFeatures();
+  };
+  layerStack.appendChild(pill);
+}
+renderFeatures();
+
+// =====================================================================
+// Module C — vindex anatomy tree
+// =====================================================================
+const VINDEX_FILES = [
+  {name: "manifest.json",       optional:false, role:"Vindex header",     levels:["browse","inference","all"], detail:"The vindex's table of contents. Records the source model, dtype (f16/f32), extraction level, and which optional files are present. <code>USE \"path/to/vindex\"</code> reads this first."},
+  {name: "feature_meta.bin",    optional:false, role:"Node labels",       levels:["browse","inference","all"], detail:"One entry per FFN feature, per layer: a guessed human label like <code>entity:France</code> or <code>syntax:past_tense</code>. Powers <code>DESCRIBE</code> and the labels you saw in Stage 2. Built by analyzing which tokens each <code>down_col</code> amplifies most."},
+  {name: "gate_vectors.bin",    optional:false, role:"Node embeddings",   levels:["browse","inference","all"], detail:"Every gate row from every layer, packed as f16 (or f32). This is the searchable side of the graph: a KNN over this file is what makes <code>WALK</code> and <code>SELECT</code> work. mmap'd, zero-copy."},
+  {name: "down_features.bin",   optional:true,  role:"Edge payloads",     levels:["inference","all"],          detail:"Feature-major <code>[intermediate, hidden]</code> down-projection vectors. Each feature's edge payload (its <code>down_col</code>) is stored as one contiguous block of 2,560 floats. Walk inference reads only the K columns it needs."},
+  {name: "up_features.bin",     optional:true,  role:"Edge gating",       levels:["inference","all"],          detail:"The matching <code>up_col</code> for each feature. Used by full-mmap walk mode and by <code>--walk-only</code>, which lets the model run without loading FFN weights from <code>safetensors</code> at all (16.6 GB → 5.5 GB on Gemma 4B)."},
+  {name: "embeddings.bin",      optional:true,  role:"Token ↔ vector",    levels:["inference","all"],          detail:"The model's input/output embedding matrix. Lets <code>INFER</code> turn tokens into hidden states without re-opening <code>safetensors</code>."},
+  {name: "down_weights.bin",    optional:true,  role:"Compile target",    levels:["all"],                       detail:"The full down-projection matrix in safetensors-compatible layout. Required by <code>COMPILE</code> — this is the file rewritten column-wise when a patch is baked in. Hardlinked to the base whenever it doesn't change."},
+  {name: "feature_index.hnsw",  optional:true,  role:"ANN accelerator",   levels:["browse","inference","all"], detail:"Optional HNSW graph over <code>gate_vectors.bin</code> for approximate nearest-neighbor search. Built lazily; useful at very large feature counts."},
+  {name: "patches/*.vlp",       optional:true,  role:"Edit overlays",     levels:["browse","inference","all"], detail:"JSON files describing INSERTs / DELETEs / UPDATEs against the base. Stacked at <code>USE</code> time — base files are never mutated. Become input to <code>COMPILE</code>."},
+];
+
+const treeList = document.getElementById("tree-list");
+const treeDetail = document.getElementById("tree-detail");
+
+function renderDetail(idx) {
+  const f = VINDEX_FILES[idx];
+  const pills = ["browse","inference","all"].map(l => {
+    const on = f.levels.includes(l);
+    return `<span class="level-pill ${on?"on":""}">${l}</span>`;
+  }).join("");
+  treeDetail.innerHTML = `
+    <h4>${f.name}</h4>
+    <div class="role ${f.optional?"optional":""}">${f.optional?"optional":"always present"} · ${f.role}</div>
+    <p style="margin-top:6px;">${f.detail}</p>
+    <div style="margin-top:14px; font-size:0.85em; color:#888;">Present at level:</div>
+    <div class="level-pills">${pills}</div>
+  `;
+  document.querySelectorAll(".tree-list .file").forEach((el, i) => {
+    el.classList.toggle("active", i === idx);
+  });
+}
+
+treeList.innerHTML = `<div style="color:#888;">my-model.vindex/</div>` +
+  VINDEX_FILES.map((f, i) =>
+    `<span class="file" data-i="${i}"><span class="indent">└─</span>${f.name}${f.optional?'<span class="dim"> (optional)</span>':''}</span>`
+  ).join("");
+
+treeList.querySelectorAll(".file").forEach(el => {
+  el.onclick = () => renderDetail(parseInt(el.dataset.i));
+});
+renderDetail(0);
+</script>
+
+</body>
+</html>

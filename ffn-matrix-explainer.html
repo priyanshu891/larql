@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>FFN as Key-Value Memory — Interactive Matrix Walkthrough</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    background: #fafafa; color: #1a1a1a;
+    line-height: 1.55;
+  }
+  .container { max-width: 1100px; margin: 0 auto; }
+  h1 { font-size: 28px; margin: 0 0 8px; }
+  h2 { font-size: 20px; margin: 32px 0 12px; color: #2a2a2a; }
+  .subtitle { color: #666; margin-bottom: 24px; }
+
+  .legend {
+    display: flex; flex-wrap: wrap; gap: 16px;
+    background: white; padding: 16px; border-radius: 10px;
+    border: 1px solid #e3e3e3; margin-bottom: 24px;
+  }
+  .legend-item { display: flex; align-items: center; gap: 8px; font-size: 14px; }
+  .legend-swatch {
+    width: 18px; height: 18px; border-radius: 4px;
+    border: 1px solid rgba(0,0,0,0.1);
+  }
+
+  .controls {
+    background: white; padding: 16px; border-radius: 10px;
+    border: 1px solid #e3e3e3; margin-bottom: 24px;
+    display: flex; flex-wrap: wrap; gap: 12px; align-items: center;
+  }
+  .controls label { font-weight: 600; margin-right: 8px; }
+  button {
+    padding: 8px 14px; border: 1px solid #d0d0d0; background: white;
+    border-radius: 6px; cursor: pointer; font-size: 14px;
+    transition: all 0.15s;
+  }
+  button:hover { background: #f0f0f0; }
+  button.active { background: #2563eb; color: white; border-color: #2563eb; }
+
+  .step {
+    background: white; padding: 20px; border-radius: 10px;
+    border: 1px solid #e3e3e3; margin-bottom: 20px;
+  }
+  .step-header {
+    font-weight: 700; font-size: 15px;
+    color: #2563eb; margin-bottom: 4px;
+    text-transform: uppercase; letter-spacing: 0.5px;
+  }
+  .step-title { font-size: 18px; font-weight: 600; margin-bottom: 8px; }
+  .step-desc { color: #555; margin-bottom: 16px; font-size: 15px; }
+
+  .matrix-row {
+    display: flex; align-items: center; gap: 16px;
+    flex-wrap: wrap; margin-bottom: 12px;
+  }
+  .matrix-block { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+  .matrix-label {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 13px; font-weight: 600;
+  }
+  .matrix-sublabel { font-size: 11px; color: #777; font-style: italic; }
+  .matrix {
+    display: grid; gap: 2px; padding: 4px;
+    border-radius: 6px; background: rgba(0,0,0,0.04);
+  }
+  .cell {
+    width: 52px; height: 36px;
+    display: flex; align-items: center; justify-content: center;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 12px; font-weight: 500;
+    border-radius: 4px; background: white;
+    border: 1px solid rgba(0,0,0,0.05);
+    transition: all 0.2s;
+  }
+  .cell.row-label, .cell.col-label {
+    background: transparent; border: none; color: #888;
+    font-size: 10px; font-style: italic;
+  }
+  .row-tag {
+    font-size: 10px; color: #555; font-style: italic;
+    text-align: right; padding-right: 8px;
+    height: 36px; display: flex; align-items: center; justify-content: flex-end;
+  }
+
+  /* color tints by role */
+  .x-color { background: #dbeafe; }      /* input / query: blue */
+  .gate-color { background: #dcfce7; }   /* keys: green */
+  .up-color { background: #ffedd5; }     /* gains: orange */
+  .down-color { background: #ede9fe; }   /* values: purple */
+  .gate-out { background: #fef3c7; }     /* gate scores: amber */
+  .up-out { background: #fee2e2; }       /* up scores: red-ish */
+  .act-color { background: #fde68a; }    /* activations: yellow */
+  .out-color { background: #cffafe; }    /* output: cyan */
+
+  .arrow { font-size: 24px; color: #999; padding: 0 4px; }
+  .op { font-family: ui-monospace, monospace; color: #2563eb; font-weight: 700; padding: 0 6px; }
+
+  .firing { box-shadow: 0 0 0 3px #f59e0b; transform: scale(1.05); }
+  .dim { opacity: 0.35; }
+
+  .feature-tags {
+    display: flex; flex-direction: column; gap: 2px;
+  }
+  .feature-tags .row-tag { height: 36px; }
+
+  .equation {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    background: #f5f5f5; padding: 10px 14px; border-radius: 6px;
+    margin: 12px 0; font-size: 14px; color: #333;
+    border-left: 3px solid #2563eb;
+  }
+
+  .takeaway {
+    background: #fef9c3; border-left: 4px solid #ca8a04;
+    padding: 14px 18px; border-radius: 6px; margin-top: 16px;
+    font-size: 14px;
+  }
+  .takeaway b { color: #713f12; }
+
+  .vert-arrow { text-align: center; color: #999; font-size: 20px; margin: 4px 0; }
+
+  details { margin-top: 12px; }
+  summary { cursor: pointer; color: #2563eb; font-size: 14px; user-select: none; }
+  details[open] summary { margin-bottom: 8px; }
+  details .body { font-size: 14px; color: #444; padding-left: 12px; border-left: 2px solid #e5e7eb; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>FFN as Key-Value Memory</h1>
+  <p class="subtitle">An interactive matrix walkthrough — see how a transformer's feed-forward block actually works.</p>
+
+  <div class="legend">
+    <div class="legend-item"><div class="legend-swatch x-color"></div><b>x</b>: input vector (the <i>query</i>)</div>
+    <div class="legend-item"><div class="legend-swatch gate-color"></div><b>W_gate</b>: keys (pattern detectors)</div>
+    <div class="legend-item"><div class="legend-swatch up-color"></div><b>W_up</b>: gains (per-feature volume knobs)</div>
+    <div class="legend-item"><div class="legend-swatch down-color"></div><b>W_down</b>: values (what gets written back)</div>
+  </div>
+
+  <div class="controls">
+    <label>Try an input:</label>
+    <button data-preset="cat" class="active">x = "cat-like"</button>
+    <button data-preset="dog">x = "dog-like"</button>
+    <button data-preset="number">x = "number-like"</button>
+    <button data-preset="mixed">x = "mixed"</button>
+    <span style="margin-left:auto; color:#666; font-size:13px;">Watch which features fire (orange glow) for each input.</span>
+  </div>
+
+  <!-- STEP 1 -->
+  <div class="step">
+    <div class="step-header">Step 1 · Setup</div>
+    <div class="step-title">Meet the four matrices</div>
+    <div class="step-desc">
+      Imagine a tiny transformer with hidden size <b>4</b> and FFN width <b>5</b>.
+      Each row of W_gate is a "feature detector" — I've labeled them so you can see what they're tuned to.
+    </div>
+
+    <div class="matrix-row">
+      <div class="matrix-block">
+        <div class="matrix-label">x  <span class="matrix-sublabel">[1 × 4] · query</span></div>
+        <div class="matrix x-color" id="m-x" style="grid-template-columns: repeat(4, 52px);"></div>
+      </div>
+    </div>
+
+    <div class="matrix-row" style="align-items: flex-start;">
+      <div class="matrix-block">
+        <div class="matrix-label">W_gate  <span class="matrix-sublabel">[5 × 4] · keys</span></div>
+        <div style="display:flex;">
+          <div class="feature-tags" id="feature-tags-gate"></div>
+          <div class="matrix gate-color" id="m-gate" style="grid-template-columns: repeat(4, 52px);"></div>
+        </div>
+      </div>
+      <div class="matrix-block">
+        <div class="matrix-label">W_up  <span class="matrix-sublabel">[5 × 4] · gains</span></div>
+        <div class="matrix up-color" id="m-up" style="grid-template-columns: repeat(4, 52px);"></div>
+      </div>
+      <div class="matrix-block">
+        <div class="matrix-label">W_down  <span class="matrix-sublabel">[5 × 4] · values</span></div>
+        <div style="display:flex;">
+          <div class="feature-tags" id="feature-tags-down"></div>
+          <div class="matrix down-color" id="m-down" style="grid-template-columns: repeat(4, 52px);"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="takeaway">
+      <b>Key idea:</b> Each row index <i>i</i> in W_gate, W_up, and W_down refers to the <i>same feature</i>.
+      Feature <i>i</i>'s key (W_gate row i) decides if it matches the input. Its gain (W_up row i) decides how loud.
+      Its value (W_down row i) decides what it writes back into the residual stream.
+    </div>
+  </div>
+
+  <!-- STEP 2 -->
+  <div class="step">
+    <div class="step-header">Step 2 · Match</div>
+    <div class="step-title">x · W_gate → "how well does each key match?"</div>
+    <div class="step-desc">
+      We dot-product the input <b>x</b> with each row of W_gate. A high score means "this feature recognized something it cares about."
+    </div>
+    <div class="equation">gate = x @ W_gate.T   →   gate[i] = dot(x, W_gate[i])</div>
+
+    <div class="matrix-row">
+      <div class="matrix-block">
+        <div class="matrix-label">x</div>
+        <div class="matrix x-color" id="m-x2" style="grid-template-columns: repeat(4, 52px);"></div>
+      </div>
+      <div class="op">@</div>
+      <div class="matrix-block">
+        <div class="matrix-label">W_gate.T</div>
+        <div class="matrix gate-color" id="m-gateT" style="grid-template-columns: repeat(5, 52px);"></div>
+      </div>
+      <div class="op">=</div>
+      <div class="matrix-block">
+        <div class="matrix-label">gate <span class="matrix-sublabel">match scores</span></div>
+        <div class="matrix gate-out" id="m-gate-out" style="grid-template-columns: repeat(5, 52px);"></div>
+      </div>
+    </div>
+    <div class="takeaway"><b>Try it:</b> Switch the input above. Watch how the match scores change — different features light up for different inputs.</div>
+  </div>
+
+  <!-- STEP 3 -->
+  <div class="step">
+    <div class="step-header">Step 3 · Decide firing strength</div>
+    <div class="step-title">silu(gate) · up → "how strongly does each feature actually fire?"</div>
+    <div class="step-desc">
+      Two things happen here. First, <b>SiLU</b> squashes the match scores: negative scores are killed (≈0), positive scores stay roughly themselves. This is the non-linearity.
+      Then we multiply by the <b>up</b> projection (x @ W_up) — that's the gain knob that says "how loudly should this feature contribute?"
+    </div>
+    <div class="equation">act = silu(gate) * up    where    up = x @ W_up.T</div>
+
+    <div class="matrix-row">
+      <div class="matrix-block">
+        <div class="matrix-label">silu(gate)</div>
+        <div class="matrix gate-out" id="m-silu" style="grid-template-columns: repeat(5, 52px);"></div>
+      </div>
+      <div class="op">×</div>
+      <div class="matrix-block">
+        <div class="matrix-label">up <span class="matrix-sublabel">x @ W_up.T</span></div>
+        <div class="matrix up-out" id="m-up-out" style="grid-template-columns: repeat(5, 52px);"></div>
+      </div>
+      <div class="op">=</div>
+      <div class="matrix-block">
+        <div class="matrix-label">act <span class="matrix-sublabel">firing strength</span></div>
+        <div class="matrix act-color" id="m-act" style="grid-template-columns: repeat(5, 52px);"></div>
+      </div>
+    </div>
+
+    <div class="takeaway">
+      <b>This is where non-linearity enters the model.</b> If we skipped SiLU, the whole network would collapse into one big linear function — no matter how many layers we stacked.
+      The orange glow shows which features <i>fire</i>. Most are near-zero — that's the sparsity LARQL exploits in its <b>Walk FFN</b>.
+    </div>
+  </div>
+
+  <!-- STEP 4 -->
+  <div class="step">
+    <div class="step-header">Step 4 · Read out values</div>
+    <div class="step-title">act · W_down → the FFN's output</div>
+    <div class="step-desc">
+      Each firing feature pulls its corresponding row out of W_down (its <b>value vector</b>) and adds it to the output, scaled by how strongly it fired.
+      Features that didn't fire contribute nothing.
+    </div>
+    <div class="equation">out = act @ W_down   →   out = Σᵢ act[i] · W_down[i]</div>
+
+    <div class="matrix-row">
+      <div class="matrix-block">
+        <div class="matrix-label">act</div>
+        <div class="matrix act-color" id="m-act2" style="grid-template-columns: repeat(5, 52px);"></div>
+      </div>
+      <div class="op">@</div>
+      <div class="matrix-block">
+        <div class="matrix-label">W_down</div>
+        <div style="display:flex;">
+          <div class="feature-tags" id="feature-tags-down2"></div>
+          <div class="matrix down-color" id="m-down2" style="grid-template-columns: repeat(4, 52px);"></div>
+        </div>
+      </div>
+      <div class="op">=</div>
+      <div class="matrix-block">
+        <div class="matrix-label">out <span class="matrix-sublabel">written to residual</span></div>
+        <div class="matrix out-color" id="m-out" style="grid-template-columns: repeat(4, 52px);"></div>
+      </div>
+    </div>
+
+    <div class="takeaway">
+      <b>The big picture:</b> The FFN is a <i>content-addressable memory</i>.
+      Input <b>x</b> is the query. W_gate stores keys. W_down stores values. The activation step decides which key-value pairs apply to <i>this</i> input.
+      That's why LARQL says <i>"the model is the database"</i> — every row is a stored fact.
+    </div>
+  </div>
+
+  <!-- LARQL connection -->
+  <div class="step">
+    <div class="step-header">In LARQL terms</div>
+    <div class="step-title">Why this matrix view matters</div>
+    <div class="step-desc">
+      LARQL decompiles a real transformer into a queryable graph by treating each FFN row as a node.
+      The Walk FFN optimization works because of a fact this demo makes obvious: <b>most features don't fire on a given input.</b>
+    </div>
+    <details>
+      <summary>How sparse is real FFN activation?</summary>
+      <div class="body">
+        On Gemma-3 4B, only ~10 out of 10,240 features per layer fire strongly for a given token.
+        Instead of a dense matmul against all 10,240 down-projection rows, LARQL does a KNN search on W_gate
+        to find the top-K matches, then sparsely sums their value vectors. Same answer, much less compute.
+      </div>
+    </details>
+    <details>
+      <summary>What does INSERT/DELETE do to these matrices?</summary>
+      <div class="body">
+        LARQL's mutation verbs add, remove, or modify rows of W_gate / W_up / W_down — without retraining.
+        INSERT adds a new (key, gain, value) triple. DELETE zeros one out. UPDATE rewrites it.
+        Patches stack on top of an immutable base vindex; COMPILE bakes them into a new standalone vindex.
+      </div>
+    </details>
+  </div>
+</div>
+
+<script>
+// ---------- toy data ----------
+// 5 features with human-readable labels so a beginner can see what's happening.
+// Each feature has a key (W_gate row), a gain (W_up row), a value (W_down row).
+const FEATURES = [
+  { name: "fluffy",  key: [ 0.9,  0.1, -0.4,  0.2], gain: [0.5, 0.6, 0.1, 0.0], value: [ 0.4,  0.7,  0.1, -0.2] },
+  { name: "barks",   key: [-0.3,  0.8,  0.5, -0.1], gain: [0.2, 0.7, 0.3, 0.1], value: [-0.3,  0.2,  0.6,  0.4] },
+  { name: "meows",   key: [ 0.7, -0.5,  0.2,  0.3], gain: [0.6, 0.2, 0.1, 0.4], value: [ 0.5, -0.1,  0.3,  0.2] },
+  { name: "digit",   key: [ 0.0,  0.1,  0.9,  0.4], gain: [0.1, 0.0, 0.8, 0.5], value: [ 0.0,  0.0, -0.4,  0.7] },
+  { name: "plural",  key: [ 0.2, -0.1, -0.3,  0.7], gain: [0.4, 0.3, 0.2, 0.6], value: [ 0.1, -0.2,  0.0,  0.5] },
+];
+
+const PRESETS = {
+  cat:    [ 0.8, -0.4,  0.1,  0.2],   // matches "meows" + a bit of "fluffy"
+  dog:    [-0.2,  0.9,  0.4,  0.0],   // matches "barks"
+  number: [ 0.0,  0.0,  0.9,  0.5],   // matches "digit"
+  mixed:  [ 0.3,  0.3,  0.2,  0.4],   // mild match across several
+};
+
+let currentX = PRESETS.cat.slice();
+
+// ---------- helpers ----------
+const fmt = (v) => {
+  const n = +v;
+  if (Math.abs(n) < 0.005) return "0.00";
+  return (n >= 0 ? " " : "") + n.toFixed(2);
+};
+const dot = (a, b) => a.reduce((s, ai, i) => s + ai * b[i], 0);
+const silu = (x) => x / (1 + Math.exp(-x));
+
+function buildMatrix(elId, data, opts = {}) {
+  const el = document.getElementById(elId);
+  if (!el) return;
+  el.innerHTML = "";
+  const flat = Array.isArray(data[0]) ? data : [data];
+  for (const row of flat) {
+    for (const v of row) {
+      const c = document.createElement("div");
+      c.className = "cell";
+      c.textContent = fmt(v);
+      if (opts.tintByMagnitude) {
+        const a = Math.min(1, Math.abs(v));
+        c.style.background = v >= 0
+          ? `rgba(34, 197, 94, ${0.08 + a * 0.4})`
+          : `rgba(239, 68, 68, ${0.08 + a * 0.4})`;
+      }
+      el.appendChild(c);
+    }
+  }
+}
+
+function buildFeatureTags(elId) {
+  const el = document.getElementById(elId);
+  if (!el) return;
+  el.innerHTML = "";
+  for (const f of FEATURES) {
+    const t = document.createElement("div");
+    t.className = "row-tag";
+    t.textContent = f.name + " →";
+    el.appendChild(t);
+  }
+}
+
+function highlightFiring(elId, scores, threshold = 0.15) {
+  const el = document.getElementById(elId);
+  if (!el) return;
+  const cells = el.querySelectorAll(".cell");
+  cells.forEach((c, i) => {
+    c.classList.remove("firing", "dim");
+    if (scores[i] > threshold) c.classList.add("firing");
+    else if (scores[i] < threshold * 0.5) c.classList.add("dim");
+  });
+}
+
+// ---------- render ----------
+function render() {
+  const x = currentX;
+  const Wgate = FEATURES.map(f => f.key);
+  const Wup   = FEATURES.map(f => f.gain);
+  const Wdown = FEATURES.map(f => f.value);
+
+  // Step 1: setup
+  buildMatrix("m-x", x);
+  buildMatrix("m-gate", Wgate);
+  buildMatrix("m-up", Wup);
+  buildMatrix("m-down", Wdown);
+  buildFeatureTags("feature-tags-gate");
+  buildFeatureTags("feature-tags-down");
+  buildFeatureTags("feature-tags-down2");
+
+  // Step 2: gate match
+  // W_gate.T is [4 × 5]
+  const WgateT = [0,1,2,3].map(j => Wgate.map(row => row[j]));
+  const gate = Wgate.map(row => dot(x, row));
+  buildMatrix("m-x2", x);
+  buildMatrix("m-gateT", WgateT);
+  buildMatrix("m-gate-out", gate, { tintByMagnitude: true });
+
+  // Step 3: silu * up
+  const siluGate = gate.map(silu);
+  const up = Wup.map(row => dot(x, row));
+  const act = siluGate.map((s, i) => s * up[i]);
+  buildMatrix("m-silu", siluGate, { tintByMagnitude: true });
+  buildMatrix("m-up-out", up, { tintByMagnitude: true });
+  buildMatrix("m-act", act, { tintByMagnitude: true });
+  highlightFiring("m-act", act, 0.1);
+
+  // Step 4: act @ W_down
+  const out = [0,1,2,3].map(j => act.reduce((s, ai, i) => s + ai * Wdown[i][j], 0));
+  buildMatrix("m-act2", act, { tintByMagnitude: true });
+  highlightFiring("m-act2", act, 0.1);
+  buildMatrix("m-down2", Wdown);
+  // dim non-firing rows of W_down so it's clear who contributed
+  const downCells = document.querySelectorAll("#m-down2 .cell");
+  downCells.forEach((c, idx) => {
+    const featIdx = Math.floor(idx / 4);
+    if (act[featIdx] < 0.1) c.classList.add("dim");
+    else c.classList.add("firing");
+  });
+  buildMatrix("m-out", out, { tintByMagnitude: true });
+}
+
+// ---------- input switching ----------
+document.querySelectorAll("[data-preset]").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll("[data-preset]").forEach(b => b.classList.remove("active"));
+    btn.classList.add("active");
+    currentX = PRESETS[btn.dataset.preset].slice();
+    render();
+  });
+});
+
+render();
+</script>
+</body>
+</html>
