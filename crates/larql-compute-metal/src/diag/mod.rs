@@ -25,14 +25,14 @@
 //! ## Usage
 //! ```bash
 //! # Per-kernel bandwidth profiler
-//! cargo run --release --features metal -p larql-compute --example diag_profile_kernels
+//! cargo run --release --features gpu -p larql-compute --example diag_profile_kernels
 //!
 //! # Full shader bench + inventory
-//! cargo run --release --features metal -p larql-compute --example diag_shader_bench
+//! cargo run --release --features gpu -p larql-compute --example diag_shader_bench
 //!
 //! # Decode pipeline stage bisect
 //! LARQL_METAL_DUMP_LAYERS=/tmp/dump \
-//!   cargo run --release --features metal -p larql-compute --example diag_decode_pipeline
+//!   cargo run --release --features gpu -p larql-compute --example diag_decode_pipeline
 //! ```
 
 pub mod kernel_profile;

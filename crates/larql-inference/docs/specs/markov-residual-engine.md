@@ -6,6 +6,14 @@
 currently validated on Gemma 3 4B, designed to admit other architectures
 behind explicit preconditions.
 
+> **State Policy slot**: `(canonical = residual stream, derivative
+> = hot K/V, contract = exact_logits under arch preconditions)`.
+> K/V is derivative — the residual stream is what continuation
+> needs; K/V can be rebuilt on demand. This classification is what
+> lets the engine drop the K/V shadow under W10 and reach
+> `standard`'s fused-kernel speed (98.0 tok/s vs 97.6 on Gemma 3
+> 4B Q4K, 2026-05-21). See [state-policy.md §3.1](../../../larql-kv/docs/state-policy.md).
+
 This spec defines *what the engine promises* and *under what preconditions*.
 It deliberately does not prescribe Rust API shapes — those are the
 implementer's call, subject to the contracts below.
@@ -403,3 +411,42 @@ When migration lands, the benchmark's Row 3 measurement becomes "measure
 `larql-inference::MarkovResidualEngine` via the `KvStrategy` adapter,"
 rather than "measure our in-tree `real_model::markov_layer`." The number
 should not change. If it does, the migration broke something.
+
+---
+
+## 14. W10 (2026-05-18) — state-bridge mask cascade (opt-in)
+
+Because hot K/V is derivative state (§2.2: K/V is "derived from
+stored residuals"), the engine can elide the kernel→engine state
+bridge on Metal without breaking the correctness contract. Two
+mask levels are gated by `LARQL_W10_HONLY=1`:
+
+| `window_size` | Mask used | What kernel skips | Engine shadow drops |
+|---|---|---|---|
+| `Some(N)` | `HOnly` | K/V staging buffer alloc + blit + GPU→CPU readback | `hot_kv` |
+| `None` | `None` | h_in staging + K/V staging + all readbacks | `hot_kv` AND `rs.stored` |
+
+Both modes preserve the **exact_logits** contract under the §4
+preconditions — they only change the *path* the state takes, not
+what state the model sees. Specifically:
+
+- Metal's internal kv cache remains the source of truth for K/V;
+  attention reads from it directly. Engine-side `hot_kv` becomes a
+  redundant shadow that we can drop.
+- Under `window=None`, no cold-tier eviction can fire, so the
+  canonical residual store `rs.stored` is never read after prefill.
+  It can be dropped too — `None` mask skips even the h_in readback.
+
+**Measured wins** (Gemma 3 4B Q4K, Metal, M3 Max, isolated runs):
+
+| Mask | tok/s | hot mem |
+|---|---:|---:|
+| `Full` (default) | 87.9 | 54.4 MB |
+| `HOnly` (window=512) | 102.1 | 30.2 MB |
+| `None` (windowless) | **106.8** | **0 MB** |
+
+`None` matches and slightly exceeds `standard`'s fused-kernel
+~100 tok/s ceiling. See `crates/larql-kv/PERFORMANCE.md` for the
+full bench protocol, the `state_capture` / `state_materialise` /
+`state_append` cascade, and verification that the bridge cost is
+where the time actually went.

@@ -113,7 +113,7 @@ pub struct WalkArgs {
     /// fused `full_pipeline_q4` prefill + `decode_token` KV-cached decode.
     /// Works for pre-norm (Llama, Mistral) and post-norm + QK-norm
     /// (Gemma 3, Gemma 4) architectures. Requires a Q4K vindex and a
-    /// build with `--features metal` on an M-series Mac.
+    /// build with `--features gpu` on an M-series Mac.
     #[arg(long)]
     pub metal: bool,
 
@@ -540,17 +540,17 @@ fn run_predict_q4k(
         // produces degenerate output ("ikea ikea ikea…"), masquerading
         // as a Granite/Gemma forward-path regression.
         let backend: Box<dyn larql_compute::ComputeBackend> = {
-            #[cfg(all(feature = "metal", target_os = "macos"))]
+            #[cfg(all(feature = "gpu", target_os = "macos"))]
             {
                 let b = larql_compute_metal::MetalBackend::new().ok_or(
-                    "Metal backend unavailable — rebuild with `--features metal` \
+                    "Metal backend unavailable — rebuild with `--features gpu` \
                      on an M-series Mac.",
                 )?;
                 Box::new(b)
             }
-            #[cfg(not(all(feature = "metal", target_os = "macos")))]
+            #[cfg(not(all(feature = "gpu", target_os = "macos")))]
             {
-                return Err("`--metal` requires the `metal` feature on macOS".into());
+                return Err("`--metal` requires the `gpu` feature on macOS".into());
             }
         };
         if !backend.supports_quant(::larql_compute::QuantFormat::Q4_K) {
@@ -1063,7 +1063,7 @@ fn generate_stream(
     let mut stdout = std::io::stdout();
     let max_tokens = args.max_tokens;
 
-    // Auto-detected compute backend. On macOS with the `metal` feature
+    // Auto-detected compute backend. On macOS with the `gpu` feature
     // this is Metal; otherwise CPU BLAS. Note the Metal backend has a
     // FLOP threshold (~500M) below which it stays on CPU — single-token
     // decode-step matmuls (m=1 × k×n) are ~5-7M FLOP and fall under
@@ -1106,6 +1106,7 @@ fn generate_stream(
                 EngineKind::Apollo { .. } => "engine=apollo",
                 EngineKind::BoundaryKv { .. } => "engine=boundary-kv",
                 EngineKind::MarkovResidualCodec { .. } => "engine=markov-rs-codec",
+                EngineKind::BoundaryPerLayer { .. } => "engine=boundary-per-layer",
             };
             (kind, label)
         }
@@ -1129,7 +1130,7 @@ fn generate_stream(
     };
     let mut engine = kind.build(backend);
     let generated = larql_kv::generation::generate_with_engine(
-        engine.as_mut(),
+        &mut engine,
         weights,
         tokenizer,
         ffn,

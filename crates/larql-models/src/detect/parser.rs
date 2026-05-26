@@ -166,6 +166,9 @@ pub(super) fn parse_model_config(config: &serde_json::Value) -> ModelConfig {
     // MLA fields
     let kv_lora_rank = text_config["kv_lora_rank"].as_u64().map(|v| v as usize);
     let q_lora_rank = text_config["q_lora_rank"].as_u64().map(|v| v as usize);
+    let qk_nope_head_dim = text_config["qk_nope_head_dim"].as_u64().map(|v| v as usize);
+    let qk_rope_head_dim = text_config["qk_rope_head_dim"].as_u64().map(|v| v as usize);
+    let v_head_dim = text_config["v_head_dim"].as_u64().map(|v| v as usize);
 
     // RoPE scaling. Four shapes appear in the wild:
     //
@@ -271,11 +274,14 @@ pub(super) fn parse_model_config(config: &serde_json::Value) -> ModelConfig {
         .as_u64()
         .map(|v| v as usize)
         .filter(|&v| v > 0);
+
     // Per-layer embedding dimension (PLE)
     let per_layer_embed_dim = text_config["hidden_size_per_layer_input"]
         .as_u64()
         .map(|v| v as usize)
         .filter(|&v| v > 0);
+
+    let has_vision_config = config.get("vision_config").is_some();
 
     ModelConfig {
         model_type,
@@ -295,6 +301,9 @@ pub(super) fn parse_model_config(config: &serde_json::Value) -> ModelConfig {
         num_shared_experts,
         kv_lora_rank,
         q_lora_rank,
+        qk_nope_head_dim,
+        qk_rope_head_dim,
+        v_head_dim,
         rope_scaling,
         attn_logit_softcapping,
         final_logit_softcapping,
@@ -314,5 +323,6 @@ pub(super) fn parse_model_config(config: &serde_json::Value) -> ModelConfig {
         enable_moe_block,
         top_k_experts,
         moe_intermediate_size,
+        has_vision_config,
     }
 }

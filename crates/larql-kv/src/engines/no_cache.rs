@@ -13,6 +13,7 @@ use crate::generation::kv_prefill_run;
 use crate::{EngineInfo, KvEngine};
 use larql_inference::ffn::FfnBackend;
 use larql_inference::forward::hooks::NoopHook;
+use larql_inference::kv_engine::EngineError;
 use larql_inference::model::ModelWeights;
 use larql_inference::{cpu_engine_backend, EngineBackend};
 
@@ -62,7 +63,10 @@ impl KvEngine for NoCacheEngine {
         weights: &ModelWeights,
         ffn: &dyn FfnBackend,
         token_ids: &[u32],
-    ) -> Option<Array2<f32>> {
+    ) -> Result<Array2<f32>, EngineError> {
+        if token_ids.is_empty() {
+            return Err(EngineError::EmptyPrompt);
+        }
         self.tokens = token_ids.to_vec();
         let (hidden, _cache) = kv_prefill_run(
             weights,
@@ -71,8 +75,11 @@ impl KvEngine for NoCacheEngine {
             None,
             Some(self.backend.as_ref()),
             &mut NoopHook,
-        )?;
-        Some(hidden)
+        )
+        .ok_or_else(|| EngineError::BackendFailure {
+            details: "kv_prefill_run returned None".into(),
+        })?;
+        Ok(hidden)
     }
 
     fn decode_step(
@@ -80,7 +87,7 @@ impl KvEngine for NoCacheEngine {
         weights: &ModelWeights,
         ffn: &dyn FfnBackend,
         token_id: u32,
-    ) -> Option<Array2<f32>> {
+    ) -> Result<Array2<f32>, EngineError> {
         self.tokens.push(token_id);
         let (hidden, _cache) = kv_prefill_run(
             weights,
@@ -89,8 +96,11 @@ impl KvEngine for NoCacheEngine {
             None,
             Some(self.backend.as_ref()),
             &mut NoopHook,
-        )?;
-        Some(hidden)
+        )
+        .ok_or_else(|| EngineError::BackendFailure {
+            details: "kv_prefill_run returned None during decode_step".into(),
+        })?;
+        Ok(hidden)
     }
 
     fn prefill_quant(
@@ -100,7 +110,7 @@ impl KvEngine for NoCacheEngine {
         index: &larql_inference::larql_vindex::VectorIndex,
         token_ids: &[u32],
         backend: &dyn larql_inference::ComputeBackend,
-    ) -> Option<Array2<f32>> {
+    ) -> Result<Array2<f32>, EngineError> {
         // Phase-1 pattern: dequant Q4K attn tensors into `weights.tensors`,
         // then run the f32 prefill path. Q4K FFN dispatches through a
         // `WalkFfn` constructed from the vindex (the bench passes
@@ -123,7 +133,7 @@ impl KvEngine for NoCacheEngine {
         index: &larql_inference::larql_vindex::VectorIndex,
         token_id: u32,
         backend: &dyn larql_inference::ComputeBackend,
-    ) -> Option<Array2<f32>> {
+    ) -> Result<Array2<f32>, EngineError> {
         larql_inference::vindex::ensure_attn_tensors_dequantised(weights, index);
         let walk_ffn = larql_inference::vindex::WalkFfn::from_config(
             weights,
@@ -149,7 +159,7 @@ impl KvEngine for NoCacheEngine {
         ffn: &dyn FfnBackend,
         index: &larql_inference::larql_vindex::VectorIndex,
         token_ids: &[u32],
-    ) -> Option<Array2<f32>> {
+    ) -> Result<Array2<f32>, EngineError> {
         // No K/V cache so we don't need to drive the per-layer loop
         // through the executor; the existing prefill (which honors the
         // FFN parameter) is the right path. Just dequant first.
@@ -164,7 +174,7 @@ impl KvEngine for NoCacheEngine {
         ffn: &dyn FfnBackend,
         index: &larql_inference::larql_vindex::VectorIndex,
         token_id: u32,
-    ) -> Option<Array2<f32>> {
+    ) -> Result<Array2<f32>, EngineError> {
         larql_inference::vindex::ensure_attn_tensors_dequantised(weights, index);
         self.decode_step(weights, ffn, token_id)
     }
@@ -208,6 +218,22 @@ mod tests {
             .expect("prefill");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
         assert_eq!(engine.window_tokens(), 3);
+    }
+
+    #[test]
+    fn no_cache_does_not_support_multimodal() {
+        // Default-false debt convention from ADR-0023. NoCacheEngine
+        // inherits `supports_multimodal = false` because it has no
+        // `prefill_from_hidden` impl yet. The CLI's `--image` capability
+        // check must hit this branch and fail with a clear error before
+        // the encoder runs. If NoCache ever grows real MM support, the
+        // override here must accompany the `prefill_from_hidden` impl —
+        // never bump capability without an implementation.
+        let engine = NoCacheEngine::new();
+        assert!(
+            !engine.supports_multimodal(),
+            "NoCacheEngine inherits the default-false convention"
+        );
     }
 
     #[test]
@@ -262,16 +288,8 @@ mod tests {
         prompt: &[u32],
         max: usize,
     ) -> Vec<u32> {
-        let mut engine = NoCacheEngine::new();
-        generate_with_engine(
-            &mut engine as &mut dyn crate::KvEngine,
-            weights,
-            tokenizer,
-            ffn,
-            prompt,
-            max,
-            |_, _| {},
-        )
+        let mut engine = crate::AnyEngine::Kv(Box::new(NoCacheEngine::new()));
+        generate_with_engine(&mut engine, weights, tokenizer, ffn, prompt, max, |_, _| {})
     }
 
     #[test]

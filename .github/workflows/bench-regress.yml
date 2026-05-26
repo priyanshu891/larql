@@ -27,7 +27,7 @@ on:
 jobs:
   bench:
     # macos-14 = Apple Silicon (M1+). Required for the metal cells —
-    # without it, drop --features metal from FEATURES to skip them
+    # without it, drop --features gpu from FEATURES to skip them
     # and run only the CPU surface on any runner.
     runs-on: macos-14
     timeout-minutes: 90

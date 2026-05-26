@@ -4,7 +4,7 @@
 //! vs seq=6 without cache. Shows the multiplier from KV caching.
 //!
 //! Usage:
-//!   cargo run --release -p larql-compute --features metal --example bench_generation
+//!   cargo run --release -p larql-compute --features gpu --example bench_generation
 
 extern crate blas_src;
 

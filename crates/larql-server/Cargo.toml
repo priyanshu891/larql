@@ -89,7 +89,8 @@ harness = false
 [features]
 default = []
 # Enable Metal-backed GPU expert kernels on the shard server.  Forwards to
-# `larql-compute`'s `metal` feature.  macOS-only.
+# the `larql-compute-metal` sibling crate directly (distinct from the
+# `gpu` umbrella feature on larql-cli/inference/kv/vindex).  macOS-only.
 metal-experts = ["dep:larql-compute-metal"]
 # ADR-0010 QUIC transport for the grid `Join` stream. Servers can connect
 # to the router via `--join quic://router:PORT` when this is on. Forwards

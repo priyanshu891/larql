@@ -46,6 +46,13 @@ pub struct EngineProfiler {
     pub attention: StageAccumulator,
     pub ffn: StageAccumulator,
     pub decode_total: StageAccumulator,
+    /// W10 instrumentation. See [`DecodeStageSummary::avg_state_capture_us`]
+    /// etc. for semantics. Engines populate these around the dispatch
+    /// hot path so a `samply` flamegraph isn't required to see where
+    /// state-bridging cost sits.
+    pub state_capture: StageAccumulator,
+    pub state_materialise: StageAccumulator,
+    pub state_append: StageAccumulator,
 }
 
 impl EngineProfiler {
@@ -60,6 +67,9 @@ impl EngineProfiler {
             avg_attention_us: self.attention.avg_us(),
             avg_ffn_us: self.ffn.avg_us(),
             avg_total_decode_us: self.decode_total.avg_us(),
+            avg_state_capture_us: self.state_capture.avg_us(),
+            avg_state_materialise_us: self.state_materialise.avg_us(),
+            avg_state_append_us: self.state_append.avg_us(),
         }
     }
 }
@@ -150,6 +160,9 @@ mod tests {
             avg_attention_us: 0.0,
             avg_ffn_us: 0.0,
             avg_total_decode_us: 0.0,
+            avg_state_capture_us: 0.0,
+            avg_state_materialise_us: 0.0,
+            avg_state_append_us: 0.0,
         };
         assert_eq!(s.avg_recompute_total_us(), 20.0);
     }
@@ -168,6 +181,9 @@ mod tests {
             avg_attention_us: 1500.0,
             avg_ffn_us: 800.0,
             avg_total_decode_us: 3200.0,
+            avg_state_capture_us: 0.0,
+            avg_state_materialise_us: 0.0,
+            avg_state_append_us: 0.0,
         };
         with_recompute.print();
 
@@ -181,6 +197,9 @@ mod tests {
             avg_attention_us: 0.0,
             avg_ffn_us: 0.0,
             avg_total_decode_us: 0.0,
+            avg_state_capture_us: 0.0,
+            avg_state_materialise_us: 0.0,
+            avg_state_append_us: 0.0,
         };
         // total == 0 hits the fallback branch in `pct`.
         no_recompute.print();
@@ -198,6 +217,9 @@ mod tests {
             avg_attention_us: 4.0,
             avg_ffn_us: 5.0,
             avg_total_decode_us: 15.0,
+            avg_state_capture_us: 0.0,
+            avg_state_materialise_us: 0.0,
+            avg_state_append_us: 0.0,
         };
         let copy = s.clone();
         assert_eq!(copy.steps, s.steps);

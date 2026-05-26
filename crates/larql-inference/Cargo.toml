@@ -9,10 +9,16 @@ keywords = ["transformer", "inference", "llm", "interpretability"]
 categories = ["science"]
 
 [dependencies]
-larql-models = { path = "../larql-models" }
+# `test-utils` feature gives `larql_models::test_fixtures::make_test_weights`,
+# which inference's `pub mod test_utils;` re-exports for downstream test
+# crates (larql-kv tests, larql-compute tests, etc.). The feature gates
+# ~80 LOC of synthetic ModelWeights builder code; production callers
+# don't reach it, and link-time dead-code elimination drops it from
+# binaries that don't use it.
+larql-models = { path = "../larql-models", features = ["test-utils"] }
 larql-compute = { path = "../larql-compute" }
 # Apple-only sibling backend.  Optional + activated by the local
-# `metal` feature; non-Mac builds skip the dep graph entirely.
+# `gpu` feature; non-Mac builds skip the dep graph entirely.
 larql-compute-metal = { path = "../larql-compute-metal", optional = true }
 larql-core = { path = "../larql-core" }
 larql-vindex = { path = "../larql-vindex" }
@@ -78,33 +84,37 @@ openblas-src = { version = "0.10", features = ["system"] }
 ndarray = { version = "0.16", features = ["blas"] }
 blas-src = { version = "0.10", features = ["accelerate"] }
 
+# Windows: no BLAS backend. See `larql-compute/Cargo.toml` for the
+# rationale. `blas-src` kept featureless so existing `extern crate
+# blas_src;` declarations still compile.
 [target.'cfg(target_os = "windows")'.dependencies]
-ndarray = { version = "0.16", features = ["blas"] }
-blas-src = { version = "0.10", features = ["openblas"], default-features = false }
-openblas-src = { version = "0.10", features = ["system"] }
+ndarray = "0.16"
+blas-src = { version = "0.10", default-features = false }
 
 [features]
 default = []
-# Pulls in the `larql-compute-metal` sibling crate.  Cascades the
-# `metal` feature on `larql-vindex` so its Metal-specific paths
-# (bench harness, hybrid decode glue) compile alongside ours.
-metal = ["dep:larql-compute-metal", "larql-vindex/metal"]
+# Umbrella for GPU-backend support. Today this pulls in the
+# `larql-compute-metal` sibling crate; future Vulkan/CUDA backends compose
+# under the same flag without forcing a per-call-site feature matrix.
+# Cascades `larql-vindex/gpu` so its GPU-specific paths (bench harness,
+# hybrid decode glue) compile alongside ours.
+gpu = ["dep:larql-compute-metal", "larql-vindex/gpu"]
 
 [[example]]
 name = "cpu_gpu_diag"
-required-features = ["metal"]
+required-features = ["gpu"]
 
 [[example]]
 name = "decode_vs_prefill"
-required-features = ["metal"]
+required-features = ["gpu"]
 
 [[example]]
 name = "residual_diff"
-required-features = ["metal"]
+required-features = ["gpu"]
 
 [[example]]
 name = "stage_bisect"
-required-features = ["metal"]
+required-features = ["gpu"]
 
 [dev-dependencies]
 assert_approx_eq = "1"

@@ -1,11 +1,11 @@
 //! Debug: per-stage buffer reads in the decode pipeline.
 //! Runs inside larql-compute where we have direct Metal access.
 //!
-//! cargo run --release --features metal -p larql-compute --example diag_decode_pipeline
+//! cargo run --release --features gpu -p larql-compute --example diag_decode_pipeline
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
-    eprintln!("This example requires macOS and --features metal");
+    eprintln!("This example requires macOS and --features gpu");
 }
 
 #[cfg(target_os = "macos")]

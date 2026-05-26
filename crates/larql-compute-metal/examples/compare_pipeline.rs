@@ -13,7 +13,7 @@ extern crate blas_src;
 fn main() {
     #[cfg(not(target_os = "macos"))]
     {
-        println!("Run on macOS with --features metal");
+        println!("Run on macOS with --features gpu");
     }
 
     #[cfg(target_os = "macos")]

@@ -14,6 +14,7 @@
 
 pub mod archive;
 pub mod engine;
+pub(crate) mod gate;
 pub mod identity;
 
 pub use archive::{ArchiveError, BoundaryArchive, InMemoryArchive};

@@ -35,10 +35,12 @@ pub(super) struct DecodeLoopOutcome {
 /// Run the decode loop for steps 1..max_tokens. The caller must already
 /// have produced the first token from the prefill output and seeded
 /// `generated_ids` / `current_token_id` accordingly.
-#[cfg_attr(
-    not(all(feature = "metal", target_os = "macos")),
-    allow(unused_variables)
-)]
+///
+/// `upload_ple` is invoked once per token before the per-token GPU
+/// dispatch when the active arch+backend support Per-Layer Embeddings
+/// (Gemma 4 E2B). For non-PLE archs or backends that don't claim
+/// [`Capability::PerLayerEmbeddings`], pass `None` and the upload is
+/// skipped entirely.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_decode_loop<F>(
     weights: &ModelWeights,
@@ -57,14 +59,7 @@ pub(super) fn run_decode_loop<F>(
     generated_ids: &mut Vec<u32>,
     mut current_token_id: u32,
     max_tokens: usize,
-    #[cfg(all(feature = "metal", target_os = "macos"))] metal_ple: Option<
-        &larql_compute_metal::MetalBackend,
-    >,
-    #[cfg(all(feature = "metal", target_os = "macos"))] upload_ple: &dyn Fn(
-        &larql_compute_metal::MetalBackend,
-        u32,
-        &[f32],
-    ),
+    upload_ple: Option<super::UploadPleFn>,
     on_token: &mut F,
 ) -> DecodeLoopOutcome
 where
@@ -77,10 +72,7 @@ where
     let profile_split = runtime.profile_split;
     let mut t_embed = 0.0f64;
     let mut t_gpu = 0.0f64;
-    // Mutated only on metal/macos via metal_take_last_split_timings.
-    #[allow(unused_mut)]
     let mut t_gate_up = 0.0f64;
-    #[allow(unused_mut)]
     let mut t_down = 0.0f64;
     let mut t_norm = 0.0f64;
     let mut t_lmhead = 0.0f64;
@@ -113,11 +105,11 @@ where
 
         let t1 = std::time::Instant::now();
         // Per-Layer Embeddings: upload the precomputed input table for
-        // the new token before the GPU dispatch. Only meaningful with
-        // `--features metal`.
-        #[cfg(all(feature = "metal", target_os = "macos"))]
-        if let Some(metal) = metal_ple {
-            upload_ple(metal, current_token_id, &x_dec);
+        // the new token before the GPU dispatch. The closure captures
+        // the PLE-capable backend; absent for non-PLE archs / backends
+        // that don't claim `Capability::PerLayerEmbeddings`.
+        if let Some(upload) = upload_ple {
+            upload(current_token_id, &x_dec);
         }
         let result = run_one_decode_step(
             weights,
@@ -191,9 +183,8 @@ where
         }
         t_embed += embed_ms;
         t_gpu += gpu_ms;
-        #[cfg(all(feature = "metal", target_os = "macos"))]
         if profile_split {
-            if let Some(pt) = larql_compute_metal::take_last_split_timings() {
+            if let Some(pt) = backend.take_split_timings() {
                 t_gate_up += pt.gate_up_ms;
                 t_down += pt.down_ms;
             }
@@ -432,10 +423,7 @@ mod tests {
             &mut generated_ids,
             /*current_token_id=*/ 0,
             /*max_tokens=*/ 3,
-            #[cfg(all(feature = "metal", target_os = "macos"))]
             None,
-            #[cfg(all(feature = "metal", target_os = "macos"))]
-            &|_b, _id, _x| {},
             &mut |_id, _text, _prob| {
                 callback_count += 1;
             },
@@ -489,10 +477,7 @@ mod tests {
             &mut generated_ids,
             /*current_token_id=*/ 0,
             /*max_tokens=*/ 4, // need step==2 to hit the split-profile branch
-            #[cfg(all(feature = "metal", target_os = "macos"))]
             None,
-            #[cfg(all(feature = "metal", target_os = "macos"))]
-            &|_b, _id, _x| {},
             &mut |_id, _text, _prob| {},
         );
     }
@@ -538,10 +523,7 @@ mod tests {
             &mut generated_ids,
             /*current_token_id=*/ 0,
             /*max_tokens=*/ 5,
-            #[cfg(all(feature = "metal", target_os = "macos"))]
             None,
-            #[cfg(all(feature = "metal", target_os = "macos"))]
-            &|_b, _id, _x| {},
             &mut |_id, _text, _prob| {},
         );
         // EOS hits on step 1 → at most 1 token emitted then break.

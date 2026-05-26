@@ -35,7 +35,7 @@ cargo run --release -p larql-cli -- convert quantize q4k \
 # Engine diagnostic — print which kernel paths the loader picks for a
 # vindex, validate Q4_K/Q6_K strides, and (with --probe) run a real
 # forward pass and print per-stage timings.
-cargo run --release --features metal -p larql-cli -- diag \
+cargo run --release --features gpu -p larql-cli -- diag \
     output/gemma3-4b-q4k-v2.vindex --probe --probe-tokens 50
 ```
 

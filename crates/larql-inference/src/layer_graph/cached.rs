@@ -11,6 +11,36 @@ use crate::model::ModelWeights;
 ///
 /// Build by running a dense forward pass for a template, capturing residuals,
 /// then storing them. At inference, skip the computation entirely.
+///
+/// # ⚠ Per-prompt only — does not generalize across prompts
+///
+/// `forward_layer` returns the **same** cached residual regardless of
+/// the live input `h`. That means the cache is bit-exact on the prompt
+/// it was built from and **wrong on every other prompt**. Empirically
+/// (2026-05-19, `contract_classify_cached_ffn` example, Gemma 3 4B Q4K,
+/// 17 same-template-length prompts):
+///
+/// | Test prompt | KL_sym | Argmax matches reference |
+/// |---|---:|:---:|
+/// | exact build prompt | 0.003 | ✓ |
+/// | "The capital of Germany is" (built from "…France is") | 2.05 | ✓ but "Paris" wrong city |
+/// | "The capital of Brazil is" | 3.75 | ✗ |
+/// | "She walked to the park" | 8.85 | ✗ |
+///
+/// The cache substitutes the *same* L0-12 residual for any input, so
+/// the entity choice is locked in by the substitution — "The capital
+/// of Germany is" still emits "Paris" with high confidence.
+///
+/// **Production call sites must use `from_residuals(Vec::new())`** (an
+/// empty cache, which produces no substitution and falls through to
+/// real compute on every layer). Any non-empty cache is only safe in
+/// experimental code that controls the input to match the build prompt.
+///
+/// A viable `CompiledLookup` engine for `LayerEngine` would need a
+/// different design — per-prompt memoization, a calibrated similarity
+/// predicate as a runtime gate, or a function-approximator that
+/// captures template variance. The current `CachedLayerGraph` is the
+/// substitution mechanism, not the engine.
 pub struct CachedLayerGraph {
     /// layer → cached residual [seq_len, hidden]. Keyed by layer index.
     cache: std::collections::HashMap<usize, Array2<f32>>,

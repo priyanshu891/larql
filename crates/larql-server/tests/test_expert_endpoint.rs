@@ -78,6 +78,9 @@ impl TestMoeArch {
                 moe_intermediate_size: Some(INTER),
                 kv_lora_rank: None,
                 q_lora_rank: None,
+                qk_nope_head_dim: None,
+                qk_rope_head_dim: None,
+                v_head_dim: None,
                 rope_scaling: None,
                 attn_logit_softcapping: None,
                 final_logit_softcapping: None,
@@ -94,6 +97,7 @@ impl TestMoeArch {
                 attention_k_eq_v: false,
                 per_layer_embed_dim: None,
                 num_kv_shared_layers: None,
+                has_vision_config: false,
             },
         }
     }

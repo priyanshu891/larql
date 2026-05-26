@@ -175,11 +175,26 @@ Real vindex (`output/gemma3-4b-v2.vindex`), 6-token prompt.
 
 ```
 predict_honest("The capital of France is"):
-  Phase 0 (L0-12): CachedLayerGraph          ~5ms  (template-fixed, 0.999 cosine)
+  Phase 0 (L0-12): CachedLayerGraph          ~5ms  (see note below — NOT in production)
   Phase 1 (L13-33): CPU attention + WalkFfn  ~195ms (GELU-tanh activation, post-norms)
   Phase 2: GPU logits KNN                     ~4ms  (vindex lm_head Q4 via Metal)
   Total:                                     ~203ms = 4.9 tok/s
 ```
+
+> **Note (2026-05-19):** Phase 0's `~5ms` is what cached substitution
+> *would* cost if the cache were populated for the prompt under test.
+> All production call sites use `CachedLayerGraph::from_residuals(Vec::new())`
+> — an empty cache, which falls through to real compute. The 0.999
+> cosine figure is **self-cosine** (cache built from prompt X,
+> evaluated on the same prompt X) and is not a generalization claim.
+> Empirical measurement (`crates/larql-kv/examples/contract_classify_cached_ffn.rs`,
+> 2026-05-19) shows that on prompts of the same shape but different
+> entity the cached substitution drives KL up to 9.38 nats and argmax
+> agreement to 58.8%. `CachedLayerGraph` as currently implemented is
+> a per-prompt memoization, not a template-class engine. See
+> `crates/larql-inference/src/layer_graph/cached.rs` doc-comment for
+> details. A viable `CompiledLookup` engine for `LayerEngine` needs a
+> different cache design.
 
 ## GPU Decode Path
 

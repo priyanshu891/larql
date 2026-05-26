@@ -91,9 +91,12 @@ larql-models-bench-test:
 
 # larql-models - architecture detection, weight loading, quant codecs.
 #
-# Per-file 90% floor, total at floor(current) - see
-# crates/larql-models/coverage-policy.json for current debt baselines.
-LARQL_MODELS_COVERAGE_MIN ?= 94
+# Per-file 90% floor; whole-crate total at 80 since `cargo llvm-cov` includes
+# the `test_fixtures.rs` support file (test-utils feature, ~30% covered when
+# measured here in isolation — see crates/larql-models/coverage-policy.json
+# for the full reasoning). The real 94% bar is enforced by the policy
+# script's `included_total_line_min_percent` over the non-fixture files.
+LARQL_MODELS_COVERAGE_MIN ?= 80
 LARQL_MODELS_COVERAGE_POLICY ?= crates/larql-models/coverage-policy.json
 LARQL_MODELS_COVERAGE_REPORT ?= coverage/larql-models/summary.json
 

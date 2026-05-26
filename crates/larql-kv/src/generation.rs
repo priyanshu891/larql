@@ -2,16 +2,17 @@
 //!
 //! Two-phase decoder:
 //!
-//! 1. **Prefill.** Run a full forward pass over the prompt via
-//!    `predict_with_ffn` (which already handles all Gemma 3 / Gemma 4
-//!    specifics — QK norm, V norm, cross-layer KV sharing, PLE, layer
-//!    scalar). During the pass, capture post-RoPE K and post-V-norm V
-//!    per layer into a [`KvCache`].
-//! 2. **Decode.** For each new token: embed it as a single row, run
-//!    the decode-step attention (Q of new token attends against
-//!    cached K/V + the new token's own K/V), FFN, next layer. At end
-//!    of layer stack, logits → argmax → next token. Streams tokens
-//!    to a caller-supplied callback.
+//! 1. **Prefill.** Run a full forward pass over the prompt: per layer,
+//!    attention (capturing post-RoPE K and post-V-norm V into the
+//!    [`KvCache`]) → FFN → per-layer embedding (PLE, Gemma-4) →
+//!    layer-scalar (Gemma-4). PLE and layer-scalar are no-ops on
+//!    archs that don't define those keys (Gemma-3, TinyModel, etc.).
+//! 2. **Decode.** For each new token: embed it as a single row,
+//!    precompute the single-token PLE input, run decode-step attention
+//!    (Q of new token attends against cached K/V + the new token's
+//!    own K/V), FFN, PLE, layer-scalar, next layer. At end of layer
+//!    stack, logits → argmax → next token. Streams tokens to a
+//!    caller-supplied callback.
 //!
 //! This is **not** a full re-implementation of the prefill path — the
 //! prefill reuses `predict_with_ffn` verbatim. Only the decode step
@@ -32,6 +33,8 @@ use larql_inference::attention::{
 };
 use larql_inference::ffn::FfnBackend;
 use larql_inference::forward::hooks::{LayerHook, NoopHook};
+use larql_inference::forward::layer::apply_layer_scalar;
+use larql_inference::forward::ple::{apply_per_layer_embedding, precompute_per_layer_inputs};
 use larql_inference::forward::{
     embed_tokens_pub, hidden_to_raw_logits, logits_to_predictions_pub, run_ffn,
 };
@@ -221,7 +224,7 @@ where
 /// backend, window, ...)`. This is the parity gate for the unification
 /// migration (see `larql-inference/docs/specs/kv-engine-unification.md` §8.4).
 pub fn generate_with_engine<F>(
-    engine: &mut dyn crate::KvEngine,
+    engine: &mut crate::AnyEngine,
     weights: &ModelWeights,
     tokenizer: &larql_inference::tokenizers::Tokenizer,
     ffn: &dyn FfnBackend,
@@ -238,8 +241,8 @@ where
 
     // ── Phase 1: prefill ──
     let last_hidden = match engine.prefill(weights, ffn, prompt_ids) {
-        Some(h) => h,
-        None => return Vec::new(),
+        Ok(h) => h,
+        Err(_) => return Vec::new(),
     };
 
     // Sample first new token from the prefill-end hidden state.
@@ -262,8 +265,97 @@ where
     let mut current_id = first.0;
     for _step in 1..max_new_tokens {
         let h_step = match engine.decode_step(weights, ffn, current_id) {
-            Some(h) => h,
+            Ok(h) => h,
+            Err(_) => break,
+        };
+        let (id, tok_str) = match argmax_next_token(weights, tokenizer, &h_step) {
+            Some(t) => t,
             None => break,
+        };
+        on_token(id, &tok_str);
+        generated.push(id);
+        if is_stop_token_str(&tok_str) {
+            break;
+        }
+        current_id = id;
+    }
+
+    generated
+}
+
+/// Multi-modal-capable peer of [`generate_with_engine`]. Same shape;
+/// the only difference is the prefill input: pre-built initial hidden
+/// state (e.g. from `larql_compute::forward::embed_plan` on an
+/// `EmbeddingPlan` mixing `Tokens` and `Precomputed` chunks) instead of
+/// a token-id slice.
+///
+/// **Contract: caller MUST verify `engine.supports_multimodal()` returns
+/// true BEFORE calling this function** (see ADR-0023). The default
+/// `prefill_from_hidden` impl panics on engines that don't support
+/// MM; the capability check is the contract and the panic is
+/// defense-in-depth. For text-only inputs on any engine, use
+/// `generate_with_engine` instead.
+///
+/// `max_new_tokens` accounting is independent of `initial_hidden.nrows()`
+/// — the budget counts only newly *decoded* tokens, never prefill rows
+/// (which may include vision/audio embeddings that aren't tokens at all).
+/// Pinned by the `max_tokens_independent_of_hidden_rows` test below.
+///
+/// Bit-identity contract: feeding the single-Tokens-chunk plan
+/// `EmbeddingPlan::from_tokens(prompt_ids)` through `embed_plan` then
+/// this function produces the same token stream as
+/// `generate_with_engine(engine, ..., prompt_ids, max_new_tokens, on_token)`
+/// — same sampling, same EOS, same callback shape. Pinned by the
+/// `wrapper_text_only_plan_matches_generate_with_engine` test below.
+pub fn generate_with_engine_from_hidden<F>(
+    engine: &mut crate::AnyEngine,
+    weights: &ModelWeights,
+    tokenizer: &larql_inference::tokenizers::Tokenizer,
+    ffn: &dyn FfnBackend,
+    initial_hidden: &Array2<f32>,
+    max_new_tokens: usize,
+    mut on_token: F,
+) -> Vec<u32>
+where
+    F: FnMut(u32, &str),
+{
+    if max_new_tokens == 0 || initial_hidden.nrows() == 0 {
+        return Vec::new();
+    }
+
+    // ── Phase 1: prefill from pre-built hidden state ──
+    // Panics if engine doesn't support MM; capability check is upstream
+    // per ADR-0023. An Err return (e.g. BackendFailure on dispatch) is
+    // mapped to an empty stream, matching `generate_with_engine`'s
+    // post-refactor behaviour.
+    let last_hidden = match engine.prefill_from_hidden(weights, ffn, initial_hidden) {
+        Ok(h) => h,
+        Err(_) => return Vec::new(),
+    };
+
+    // ── Sample first new token (identical to generate_with_engine) ──
+    let first = match argmax_next_token(weights, tokenizer, &last_hidden) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+    on_token(first.0, &first.1);
+
+    let mut generated = Vec::with_capacity(max_new_tokens);
+    generated.push(first.0);
+    if is_stop_token_str(&first.1) {
+        return generated;
+    }
+    if max_new_tokens == 1 {
+        return generated;
+    }
+
+    // ── Phase 2: decode loop (verbatim from generate_with_engine; ADR-0023
+    // scoped-out: decode-loop embedding stays text-token-based) ──
+    let mut current_id = first.0;
+    for _step in 1..max_new_tokens {
+        let h_step = match engine.decode_step(weights, ffn, current_id) {
+            Ok(h) => h,
+            Err(_) => break,
         };
         let (id, tok_str) = match argmax_next_token(weights, tokenizer, &h_step) {
             Some(t) => t,
@@ -309,6 +401,10 @@ pub fn kv_prefill_run(
     };
 
     let mut h = embed_tokens_pub(weights, prompt_ids);
+    // Per-Layer Embedding inputs for Gemma-4 archs. Returns empty Vec
+    // for non-PLE archs (`ple_inputs.get(layer)` then yields `None` and
+    // `apply_per_layer_embedding` is a no-op).
+    let ple_inputs = precompute_per_layer_inputs(weights, &h, prompt_ids);
     for layer in 0..num_layers {
         hook.on_pre_layer(layer, &h);
 
@@ -319,7 +415,10 @@ pub fn kv_prefill_run(
 
         hook.on_post_attention(layer, &mut h_post_attn);
 
-        let (mut h_out, _) = run_ffn(weights, &h_post_attn, layer, ffn, false);
+        let (h_post_ffn, _) = run_ffn(weights, &h_post_attn, layer, ffn, false);
+        let mut h_out =
+            apply_per_layer_embedding(weights, &h_post_ffn, layer, ple_inputs.get(layer));
+        apply_layer_scalar(weights, &mut h_out, layer);
 
         hook.on_post_layer(layer, &mut h_out);
         h = h_out;
@@ -350,6 +449,11 @@ pub fn kv_decode_step_run(
     let num_layers = weights.num_layers;
     let h_new = embed_tokens_pub(weights, &[token_id]);
     let abs_position = cache.next_position;
+    // PLE inputs are per-token. Recompute for this single-token decode
+    // step rather than indexing a prefill-sized slab. Matches the
+    // recipe used by `vindex::kquant_forward::cached` and the GPU
+    // `layer_graph::generate` decode loop.
+    let ple_inputs = precompute_per_layer_inputs(weights, &h_new, &[token_id]);
     let mut h_step = h_new;
     for layer in 0..num_layers {
         hook.on_pre_layer(layer, &h_step);
@@ -368,7 +472,10 @@ pub fn kv_decode_step_run(
 
         hook.on_post_attention(layer, &mut h_post_attn);
 
-        let (mut h_out, _) = run_ffn(weights, &h_post_attn, layer, ffn, false);
+        let (h_post_ffn, _) = run_ffn(weights, &h_post_attn, layer, ffn, false);
+        let mut h_out =
+            apply_per_layer_embedding(weights, &h_post_ffn, layer, ple_inputs.get(layer));
+        apply_layer_scalar(weights, &mut h_out, layer);
 
         hook.on_post_layer(layer, &mut h_out);
         h_step = h_out;
@@ -646,29 +753,45 @@ mod tests {
             weights: &ModelWeights,
             ffn: &dyn FfnBackend,
             token_ids: &[u32],
-        ) -> Option<Array2<f32>> {
+        ) -> Result<Array2<f32>, larql_inference::kv_engine::EngineError> {
             if self.fail_prefill {
-                return None;
+                return Err(larql_inference::kv_engine::EngineError::BackendFailure {
+                    details: "test stub: fail_prefill set".into(),
+                });
             }
             let (hidden, cache) =
-                kv_prefill_run(weights, ffn, token_ids, None, None, &mut NoopHook)?;
+                kv_prefill_run(weights, ffn, token_ids, None, None, &mut NoopHook).ok_or_else(
+                    || larql_inference::kv_engine::EngineError::BackendFailure {
+                        details: "kv_prefill_run returned None".into(),
+                    },
+                )?;
             self.cache = Some(cache);
-            Some(hidden)
+            Ok(hidden)
         }
         fn decode_step(
             &mut self,
             weights: &ModelWeights,
             ffn: &dyn FfnBackend,
             token_id: u32,
-        ) -> Option<Array2<f32>> {
+        ) -> Result<Array2<f32>, larql_inference::kv_engine::EngineError> {
             self.decode_count += 1;
             if let Some(limit) = self.fail_decode_after {
                 if self.decode_count > limit {
-                    return None;
+                    return Err(larql_inference::kv_engine::EngineError::BackendFailure {
+                        details: "test stub: fail_decode_after exceeded".into(),
+                    });
                 }
             }
-            let cache = self.cache.as_mut()?;
-            kv_decode_step_run(weights, ffn, cache, token_id, None, &mut NoopHook)
+            let cache = self.cache.as_mut().ok_or_else(|| {
+                larql_inference::kv_engine::EngineError::InvariantViolation {
+                    what: "decode_step called before prefill".into(),
+                }
+            })?;
+            kv_decode_step_run(weights, ffn, cache, token_id, None, &mut NoopHook).ok_or_else(
+                || larql_inference::kv_engine::EngineError::BackendFailure {
+                    details: "kv_decode_step_run returned None".into(),
+                },
+            )
         }
         fn memory_bytes(&self) -> usize {
             0
@@ -689,7 +812,7 @@ mod tests {
         let weights = make_test_weights();
         let tokenizer = make_test_tokenizer(weights.vocab_size);
         let ffn = WeightFfn { weights: &weights };
-        let mut eng = fresh_stub();
+        let mut eng = crate::AnyEngine::Kv(Box::new(fresh_stub()));
         let out = generate_with_engine(&mut eng, &weights, &tokenizer, &ffn, &[], 5, |_, _| {});
         assert!(out.is_empty());
     }
@@ -699,7 +822,7 @@ mod tests {
         let weights = make_test_weights();
         let tokenizer = make_test_tokenizer(weights.vocab_size);
         let ffn = WeightFfn { weights: &weights };
-        let mut eng = fresh_stub();
+        let mut eng = crate::AnyEngine::Kv(Box::new(fresh_stub()));
         let out = generate_with_engine(
             &mut eng,
             &weights,
@@ -717,7 +840,7 @@ mod tests {
         let weights = make_test_weights();
         let tokenizer = make_test_tokenizer(weights.vocab_size);
         let ffn = WeightFfn { weights: &weights };
-        let mut eng = fresh_stub();
+        let mut eng = crate::AnyEngine::Kv(Box::new(fresh_stub()));
         let out = generate_with_engine(
             &mut eng,
             &weights,
@@ -735,7 +858,7 @@ mod tests {
         let weights = make_test_weights();
         let tokenizer = make_test_tokenizer(weights.vocab_size);
         let ffn = WeightFfn { weights: &weights };
-        let mut eng = fresh_stub();
+        let mut eng = crate::AnyEngine::Kv(Box::new(fresh_stub()));
         let mut callbacks = 0usize;
         let out = generate_with_engine(
             &mut eng,
@@ -755,8 +878,9 @@ mod tests {
         let weights = make_test_weights();
         let tokenizer = make_test_tokenizer(weights.vocab_size);
         let ffn = WeightFfn { weights: &weights };
-        let mut eng = fresh_stub();
-        eng.fail_prefill = true;
+        let mut stub = fresh_stub();
+        stub.fail_prefill = true;
+        let mut eng = crate::AnyEngine::Kv(Box::new(stub));
         let out = generate_with_engine(&mut eng, &weights, &tokenizer, &ffn, &[0u32], 3, |_, _| {});
         assert!(out.is_empty());
     }
@@ -766,8 +890,9 @@ mod tests {
         let weights = make_test_weights();
         let tokenizer = make_test_tokenizer(weights.vocab_size);
         let ffn = WeightFfn { weights: &weights };
-        let mut eng = fresh_stub();
-        eng.fail_decode_after = Some(1);
+        let mut stub = fresh_stub();
+        stub.fail_decode_after = Some(1);
+        let mut eng = crate::AnyEngine::Kv(Box::new(stub));
         let out = generate_with_engine(
             &mut eng,
             &weights,
@@ -952,5 +1077,195 @@ mod tests {
                 "steering with α=5 must change generated tokens"
             );
         }
+    }
+
+    // ── Gemma-4 PLE arch coverage (regression test for issue #98) ──
+    //
+    // Before this PR, `kv_prefill_run` and `kv_decode_step_run` called
+    // `run_attention*` + `run_ffn` directly, skipping the
+    // `apply_per_layer_embedding` and `apply_layer_scalar` steps that
+    // `run_layer_with_ffn` performs. On Gemma-4 (`gemma-4-E4B-it`),
+    // the missing PLE contribution compounded across decode steps and
+    // produced garbage (`ッケッケTobchal的存在` after a correct first
+    // token). These tests pin both phases through the synthetic E2B-like
+    // fixture so any future regression that drops PLE / layer_scalar
+    // from the cached path fails locally rather than at the user's
+    // terminal.
+
+    /// `kv_prefill_run` must execute cleanly on a PLE arch — the
+    /// fixture's PLE keys + projection tensors / norms / gates must be
+    /// reachable from the prefill loop without dimension mismatch or
+    /// panic. With zero-valued weights the output is also zero, so the
+    /// assertion is finiteness + correct hidden-dim shape, not a
+    /// specific value.
+    #[test]
+    fn kv_prefill_run_works_on_synthetic_e2b_ple_arch() {
+        let weights = larql_inference::test_utils::make_synthetic_e2b_like_weights();
+        let ffn = WeightFfn { weights: &weights };
+        let prompt = [0u32, 1, 2];
+        let (last_hidden, cache) =
+            kv_prefill_run(&weights, &ffn, &prompt, None, None, &mut NoopHook)
+                .expect("PLE-arch prefill should not fail");
+        assert_eq!(last_hidden.shape(), &[1, weights.hidden_size]);
+        assert!(
+            last_hidden.iter().all(|v| v.is_finite()),
+            "prefill output must be finite"
+        );
+        assert_eq!(cache.next_position, prompt.len());
+    }
+
+    /// `kv_decode_step_run` must execute cleanly on a PLE arch for at
+    /// least three successive steps. Issue #98's signature was: step 1
+    /// looks fine, steps 2+ degrade. Driving three steps exercises the
+    /// per-decode-step PLE recompute (`precompute_per_layer_inputs(..,
+    /// &[token_id])`) under the same code path that produced the
+    /// regression.
+    #[test]
+    fn kv_decode_step_run_works_for_multiple_steps_on_synthetic_e2b_ple_arch() {
+        let weights = larql_inference::test_utils::make_synthetic_e2b_like_weights();
+        let ffn = WeightFfn { weights: &weights };
+        let prompt = [0u32, 1];
+        let (_h_prefill, mut cache) =
+            kv_prefill_run(&weights, &ffn, &prompt, None, None, &mut NoopHook)
+                .expect("PLE-arch prefill should not fail");
+
+        for step in 0..3 {
+            let h_step = kv_decode_step_run(&weights, &ffn, &mut cache, 0u32, None, &mut NoopHook)
+                .unwrap_or_else(|| panic!("decode step {step} returned None"));
+            assert_eq!(h_step.shape(), &[1, weights.hidden_size]);
+            assert!(
+                h_step.iter().all(|v| v.is_finite()),
+                "decode step {step} output must be finite"
+            );
+        }
+        assert_eq!(cache.next_position, prompt.len() + 3);
+    }
+
+    // ─── Phase 1d.3b: generate_with_engine_from_hidden contracts ─────────
+    //
+    // Two pins:
+    //   1. Bit-identity: a single-Tokens-chunk plan run through
+    //      embed_plan → generate_with_engine_from_hidden produces the
+    //      same token stream as generate_with_engine(tokens). This is
+    //      the analog of the dispatch-level bit-identity test, applied
+    //      one layer up. If they diverge, something in the wrapper
+    //      silently dropped a flag/callback/state vs the original.
+    //   2. max_tokens accounting independent of initial_hidden.nrows().
+    //      The contract is "max_new_tokens counts decoded tokens only,
+    //      never prefill rows" — this catches the off-by-one risk that
+    //      would manifest as captions being one token short, or vision
+    //      tokens being counted against the user's --max-tokens budget.
+
+    #[test]
+    fn wrapper_text_only_plan_matches_generate_with_engine() {
+        use crate::engines::standard::StandardEngine;
+        use crate::AnyEngine;
+        use larql_compute::forward::{embed_plan, EmbeddingPlan};
+        let weights = make_test_weights();
+        let tokenizer = make_test_tokenizer(weights.vocab_size);
+        let ffn = WeightFfn { weights: &weights };
+        let tokens = [0u32, 1, 2, 3];
+        let max_new = 4usize;
+
+        // Path A: text path. Post kv-engine-retrieval-trait-split,
+        // engines are wrapped in AnyEngine for uniform dispatch.
+        let mut engine_a = AnyEngine::Kv(Box::new(StandardEngine::new(None)));
+        let mut emitted_a: Vec<(u32, String)> = Vec::new();
+        let ids_a = generate_with_engine(
+            &mut engine_a,
+            &weights,
+            &tokenizer,
+            &ffn,
+            &tokens,
+            max_new,
+            |id, s| emitted_a.push((id, s.to_string())),
+        );
+
+        // Path B: single-Tokens-chunk plan → embed_plan → wrapper.
+        let mut engine_b = AnyEngine::Kv(Box::new(StandardEngine::new(None)));
+        let plan = EmbeddingPlan::from_tokens(&tokens);
+        let initial_hidden = embed_plan(&weights, &plan);
+        let mut emitted_b: Vec<(u32, String)> = Vec::new();
+        let ids_b = generate_with_engine_from_hidden(
+            &mut engine_b,
+            &weights,
+            &tokenizer,
+            &ffn,
+            &initial_hidden,
+            max_new,
+            |id, s| emitted_b.push((id, s.to_string())),
+        );
+
+        assert_eq!(
+            ids_a, ids_b,
+            "text path and from-hidden wrapper must produce identical token streams \
+             on a single-Tokens-chunk plan"
+        );
+        assert_eq!(
+            emitted_a, emitted_b,
+            "streaming callback must fire identically across paths \
+             (same id + same decoded text per token)"
+        );
+    }
+
+    #[test]
+    fn wrapper_max_tokens_independent_of_hidden_rows() {
+        // Build a hidden state with MORE rows than max_new_tokens to
+        // confirm the budget isn't accidentally tangled with prefill
+        // length. If it were, generation would terminate early (or not
+        // at all) depending on the off-by-one's direction.
+        use crate::engines::standard::StandardEngine;
+        use larql_compute::forward::{embed_plan, EmbeddingPlan};
+        let weights = make_test_weights();
+        let tokenizer = make_test_tokenizer(weights.vocab_size);
+        let ffn = WeightFfn { weights: &weights };
+
+        let prefill_rows = 7usize;
+        let max_new = 3usize;
+        let tokens: Vec<u32> = (0u32..prefill_rows as u32).collect();
+        let plan = EmbeddingPlan::from_tokens(&tokens);
+        let initial_hidden = embed_plan(&weights, &plan);
+        assert_eq!(initial_hidden.nrows(), prefill_rows);
+
+        let mut engine = crate::AnyEngine::Kv(Box::new(StandardEngine::new(None)));
+        let ids = generate_with_engine_from_hidden(
+            &mut engine,
+            &weights,
+            &tokenizer,
+            &ffn,
+            &initial_hidden,
+            max_new,
+            |_, _| {},
+        );
+
+        // Wrapper may terminate early on EOS (stop-token in the
+        // synthetic stream), but must NEVER exceed max_new even though
+        // initial_hidden has more rows than max_new.
+        assert!(
+            ids.len() <= max_new,
+            "wrapper decoded {} tokens but max_new_tokens={max_new}; \
+             prefill rows ({prefill_rows}) leaked into the token budget",
+            ids.len(),
+        );
+    }
+
+    #[test]
+    fn wrapper_zero_hidden_rows_returns_empty() {
+        use crate::engines::standard::StandardEngine;
+        let weights = make_test_weights();
+        let tokenizer = make_test_tokenizer(weights.vocab_size);
+        let ffn = WeightFfn { weights: &weights };
+        let empty = Array2::<f32>::zeros((0, weights.hidden_size));
+        let mut engine = crate::AnyEngine::Kv(Box::new(StandardEngine::new(None)));
+        let ids = generate_with_engine_from_hidden(
+            &mut engine,
+            &weights,
+            &tokenizer,
+            &ffn,
+            &empty,
+            5,
+            |_, _| {},
+        );
+        assert!(ids.is_empty(), "zero-row hidden should yield empty stream");
     }
 }

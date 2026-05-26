@@ -657,6 +657,63 @@ impl DecodeBackend for MetalBackend {
         ))
     }
 
+    fn decode_token_with_state_dump(
+        &self,
+        layers: &[larql_compute::FullPipelineLayer<'_>],
+        x: &[f32],
+        hidden: usize,
+        inter: usize,
+        state: Option<&mut larql_compute::DecodeStateDump>,
+    ) -> Option<Vec<f32>> {
+        self.decode_token_with_state_dump_masked(
+            layers,
+            x,
+            hidden,
+            inter,
+            state,
+            larql_compute::StateDumpMask::Full,
+        )
+    }
+
+    fn decode_token_with_state_dump_masked(
+        &self,
+        layers: &[larql_compute::FullPipelineLayer<'_>],
+        x: &[f32],
+        hidden: usize,
+        inter: usize,
+        state: Option<&mut larql_compute::DecodeStateDump>,
+        mask: larql_compute::StateDumpMask,
+    ) -> Option<Vec<f32>> {
+        let Some(state) = state else {
+            // No state requested → fall back to the fast fused path.
+            return <Self as DecodeBackend>::decode_token(self, layers, x, hidden, inter);
+        };
+        let (q_dim, kv_dim, num_q_heads, num_kv_heads, head_dim, rope_base) =
+            legacy_l0_geometry(layers);
+        let mut cache_guard = self.kv_cache.lock().unwrap();
+        let kv = self.ensure_kv_cache_for_layers(
+            &mut cache_guard,
+            layers,
+            crate::decode::DEFAULT_KV_CACHE_MAX_SEQ,
+        );
+        Some(MetalBackend::decode_token_with_state_dump_masked_fn(
+            self,
+            kv,
+            layers,
+            x,
+            hidden,
+            inter,
+            q_dim,
+            kv_dim,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rope_base,
+            state,
+            mask,
+        ))
+    }
+
     fn decode_token_with_moe(
         &self,
         layers: &[larql_compute::FullPipelineLayer<'_>],
@@ -756,6 +813,8 @@ impl DecodeBackend for MetalBackend {
             rope_base,
             Some(&mut fire_wrapper),
             Some(moe_collect_fn),
+            None, // no state capture on split fire/collect MoE path
+            larql_compute::StateDumpMask::Full,
         ))
     }
 

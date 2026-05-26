@@ -50,7 +50,9 @@ pub use engines::unlimited_context::UnlimitedContextEngine;
 // `larql_kv::KvEngine` continues to resolve to the same trait.
 //
 // See `crates/larql-inference/docs/specs/kv-engine-unification.md` §10.4.
-pub use larql_inference::{DecodeStageSummary, EngineInfo, KvEngine};
+pub use larql_inference::kv_engine::{
+    AnyEngine, DecodeStageSummary, EngineError, EngineInfo, KvEngine, RetrievalEngine,
+};
 
 // ─── EngineKind ───────────────────────────────────────────────────────────────
 
@@ -95,6 +97,15 @@ pub enum EngineKind {
     MarkovResidualCodec {
         window_size: Option<usize>,
         codec: markov_residual_codec::ColdResidualCodec,
+    },
+    /// `BoundaryPerLayerEngine`: per-layer codec policy on the cold tier.
+    /// v0.1 ships `Bf16` uniform across layers; the `num_layers` arg
+    /// must match `weights.num_layers` at prefill time (construction
+    /// errors otherwise). See
+    /// `crates/larql-kv/src/engines/boundary_per_layer/`.
+    BoundaryPerLayer {
+        window_size: Option<usize>,
+        num_layers: usize,
     },
 }
 
@@ -187,6 +198,15 @@ impl EngineKind {
                 // calibration that does not yet exist in tree.
                 codec: markov_residual_codec::ColdResidualCodec::Bf16,
             }),
+            "boundary-per-layer" | "boundary_per_layer" | "boundary-pl" => {
+                // num_layers defaults to 34 (Gemma 3 4B); override via
+                // `layers=N` when benching other architectures. Mismatch
+                // against weights.num_layers errors at prefill.
+                Some(EngineKind::BoundaryPerLayer {
+                    window_size: params.get("window").and_then(|v| v.parse().ok()),
+                    num_layers: get_usize("layers", 34),
+                })
+            }
             _ => None,
         }
     }
@@ -254,15 +274,52 @@ impl EngineKind {
             EngineKind::Apollo { .. } => "apollo",
             EngineKind::BoundaryKv { .. } => "boundary-kv",
             EngineKind::MarkovResidualCodec { .. } => "markov-rs-codec",
+            EngineKind::BoundaryPerLayer { .. } => "boundary-per-layer",
         }
     }
 
+    /// All engine names recognised by [`Self::from_name`] — bare names
+    /// only, no parameter syntax. Single source of truth for the
+    /// "supported engines" help text in CLI error messages so the list
+    /// doesn't drift when a new engine lands.
+    ///
+    /// The list contains the canonical name for each variant (the one
+    /// `display_name` returns). Aliases that `from_name` also accepts
+    /// (`full`/`fp32` for `standard`, `none`/`off` for `no-cache`,
+    /// etc.) are intentionally omitted — the help text shows users
+    /// the recommended spelling, not every accepted spelling.
+    ///
+    /// Adding a new engine variant **must** add a new entry here; the
+    /// `engine_kind_supported_names_covers_every_variant` test in
+    /// this module enforces that invariant via the parser.
+    pub fn supported_names() -> &'static [&'static str] {
+        &[
+            "standard",
+            "no-cache",
+            "markov-rs",
+            "markov-rs-codec",
+            "unlimited-context",
+            "turbo-quant",
+            "apollo",
+            "boundary-kv",
+            "boundary-per-layer",
+        ]
+    }
+
     /// Build a boxed engine, dispatching compute through `backend`.
-    pub fn build(self, backend: Box<dyn larql_inference::EngineBackend>) -> Box<dyn KvEngine> {
+    pub fn build(self, backend: Box<dyn larql_inference::EngineBackend>) -> AnyEngine {
         self.build_with_profiling(backend, false)
     }
 
     /// Build a boxed engine with optional per-stage decode profiling.
+    ///
+    /// Returns [`AnyEngine`] — the dispatch enum that wraps either a
+    /// [`KvEngine`] (per-token K/V cache engines: standard, no_cache,
+    /// markov_residual, markov_residual_codec, unlimited_context,
+    /// turbo_quant, boundary_kv, boundary_per_layer) or a
+    /// [`RetrievalEngine`] (Apollo, future Mode 5). Callers branch
+    /// once on the enum variant and stay in the variant-specific code
+    /// path thereafter. See the `AnyEngine` docs for the rationale.
     ///
     /// Takes [`larql_inference::EngineBackend`] — the umbrella over
     /// `ComputeBackend + KvDispatch` — so migrated engines (Step 3c
@@ -273,35 +330,41 @@ impl EngineKind {
         self,
         backend: Box<dyn larql_inference::EngineBackend>,
         profiling: bool,
-    ) -> Box<dyn KvEngine> {
+    ) -> AnyEngine {
         // `profiling` is honoured only by engines that implement it
         // (currently MarkovResidual). Other engines accept the flag for
         // a uniform construction API and ignore it.
         let _ = profiling;
         match self {
-            EngineKind::Standard { window_size } => {
-                Box::new(standard::StandardEngine::with_backend(window_size, backend))
+            EngineKind::Standard { window_size } => AnyEngine::Kv(Box::new(
+                standard::StandardEngine::with_backend(window_size, backend),
+            )),
+            EngineKind::NoCache => {
+                AnyEngine::Kv(Box::new(no_cache::NoCacheEngine::with_backend(backend)))
             }
-            EngineKind::NoCache => Box::new(no_cache::NoCacheEngine::with_backend(backend)),
-            EngineKind::MarkovResidual { window_size } => Box::new(
+            EngineKind::MarkovResidual { window_size } => AnyEngine::Kv(Box::new(
                 markov_residual::MarkovResidualEngine::with_backend(window_size, backend)
                     .with_profiling(profiling),
-            ),
-            EngineKind::UnlimitedContext { window_size } => Box::new(
-                unlimited_context::UnlimitedContextEngine::with_backend(window_size, backend),
-            ),
-            EngineKind::TurboQuant { bits } => {
-                Box::new(turbo_quant::TurboQuantEngine::with_backend(bits, backend))
-            }
+            )),
+            EngineKind::UnlimitedContext { window_size } => AnyEngine::Kv(Box::new(
+                unlimited_context::UnlimitedContextEngine::with_backend(window_size, backend)
+                    .with_profiling(profiling),
+            )),
+            EngineKind::TurboQuant { bits } => AnyEngine::Kv(Box::new(
+                turbo_quant::TurboQuantEngine::with_backend(bits, backend)
+                    .with_profiling(profiling),
+            )),
             EngineKind::Apollo {
                 injection_layer,
                 inject_coefficient,
                 top_k,
-            } => Box::new(apollo::ApolloEngine::new(apollo::InjectionConfig {
-                injection_layer,
-                inject_coefficient,
-                top_k,
-            })),
+            } => AnyEngine::Retrieval(Box::new(apollo::ApolloEngine::new(
+                apollo::InjectionConfig {
+                    injection_layer,
+                    inject_coefficient,
+                    top_k,
+                },
+            ))),
             EngineKind::BoundaryKv {
                 window_size,
                 chunk_tokens,
@@ -311,15 +374,47 @@ impl EngineKind {
                 let mut config = boundary_kv::BoundaryKvEngineConfig::new(sequence_id, identity);
                 config.window_size = window_size;
                 config.chunk_tokens = chunk_tokens;
-                Box::new(boundary_kv::BoundaryKvEngine::with_backend(config, backend))
+                AnyEngine::Kv(Box::new(boundary_kv::BoundaryKvEngine::with_backend(
+                    config, backend,
+                )))
             }
-            EngineKind::MarkovResidualCodec { window_size, codec } => Box::new(
+            EngineKind::MarkovResidualCodec { window_size, codec } => AnyEngine::Kv(Box::new(
                 markov_residual_codec::MarkovResidualCodecEngine::with_backend(
                     window_size,
                     codec,
                     backend,
-                ),
-            ),
+                )
+                .with_profiling(profiling),
+            )),
+            EngineKind::BoundaryPerLayer {
+                window_size,
+                num_layers,
+            } => {
+                // v0.1: uniform Bf16 policy. Calibration store seeded
+                // with the trivial bf16 record. Real production use
+                // would inject a calibration store populated by the
+                // offline sweep harness (per spec §4.7).
+                use boundary_per_layer::{
+                    BoundaryCalibrationRecord, BoundaryCalibrationStore, BoundaryLayerPolicy,
+                    BoundaryPerLayerEngine, InMemoryCalibrationStore,
+                };
+                let policy = BoundaryLayerPolicy::bf16_uniform("cli", num_layers);
+                let cal = InMemoryCalibrationStore::new();
+                cal.put(BoundaryCalibrationRecord::bf16_uniform_default(
+                    policy.fingerprint(),
+                ))
+                .expect("calibration store seed failed");
+                AnyEngine::Kv(Box::new(
+                    BoundaryPerLayerEngine::with_backend(
+                        window_size,
+                        policy,
+                        num_layers,
+                        &cal,
+                        backend,
+                    )
+                    .expect("boundary-per-layer construction failed"),
+                ))
+            }
         }
     }
 }
@@ -463,6 +558,43 @@ mod tests {
                 ..
             }) => {}
             other => panic!("expected BoundaryKv{{window=128,chunk=32}}, got {other:?}"),
+        }
+    }
+
+    // ── BoundaryPerLayer parsing ─────────────────────────────────────────
+
+    #[test]
+    fn engine_kind_from_name_boundary_per_layer_aliases() {
+        for name in &["boundary-per-layer", "boundary_per_layer", "boundary-pl"] {
+            assert!(
+                matches!(
+                    EngineKind::from_name(name),
+                    Some(EngineKind::BoundaryPerLayer { .. })
+                ),
+                "failed to parse {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn engine_kind_from_name_boundary_per_layer_defaults_to_34_layers() {
+        match EngineKind::from_name("boundary-per-layer") {
+            Some(EngineKind::BoundaryPerLayer {
+                window_size: None,
+                num_layers: 34,
+            }) => {}
+            other => panic!("expected BoundaryPerLayer{{layers=34}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn engine_kind_from_name_boundary_per_layer_with_window_and_layers() {
+        match EngineKind::from_name("boundary-per-layer:window=256,layers=12") {
+            Some(EngineKind::BoundaryPerLayer {
+                window_size: Some(256),
+                num_layers: 12,
+            }) => {}
+            other => panic!("expected BoundaryPerLayer{{window=256,layers=12}}, got {other:?}"),
         }
     }
 
@@ -711,6 +843,61 @@ mod compliance_tests {
     }
 
     #[test]
+    fn supported_names_every_entry_parses_back_via_from_name() {
+        // Every name `supported_names()` advertises must be a name the
+        // parser actually accepts. Catches the failure mode where
+        // someone adds a variant to one side without the other.
+        for name in EngineKind::supported_names() {
+            let kind = EngineKind::from_name(name).unwrap_or_else(|| {
+                panic!("supported_names lists {name:?} but from_name rejected it")
+            });
+            assert_eq!(
+                kind.display_name(),
+                *name,
+                "supported_names entry {name:?} parses to a different display_name"
+            );
+        }
+    }
+
+    #[test]
+    fn supported_names_covers_every_engine_kind_variant() {
+        // Build one of every variant via the parser, collect their
+        // canonical names, and verify supported_names() lists each.
+        // This is the test the doc comment refers to; adding a new
+        // EngineKind variant without adding a supported_names entry
+        // makes this test fail with a useful diff.
+        let one_of_each: Vec<&'static str> = [
+            "standard",
+            "no-cache",
+            "markov-rs",
+            "markov-rs-codec",
+            "unlimited-context",
+            "turbo-quant",
+            "apollo",
+            "boundary-kv",
+            "boundary-per-layer",
+        ]
+        .iter()
+        .map(|s| {
+            EngineKind::from_name(s)
+                .unwrap_or_else(|| panic!("test fixture {s:?} failed to parse"))
+                .display_name()
+        })
+        .collect();
+        for name in &one_of_each {
+            assert!(
+                EngineKind::supported_names().contains(name),
+                "EngineKind variant with display_name {name:?} is missing from supported_names"
+            );
+        }
+        assert_eq!(
+            EngineKind::supported_names().len(),
+            one_of_each.len(),
+            "supported_names and the variant set are out of sync"
+        );
+    }
+
+    #[test]
     fn from_name_all_engines_parseable() {
         let specs = [
             ("standard", "standard"),
@@ -763,18 +950,18 @@ mod compliance_tests {
             _weights: &ModelWeights,
             _ffn: &dyn larql_inference::ffn::FfnBackend,
             _token_ids: &[u32],
-        ) -> Option<Array2<f32>> {
+        ) -> Result<Array2<f32>, EngineError> {
             self.prefill_calls += 1;
-            Some(Array2::zeros((1, 4)))
+            Ok(Array2::zeros((1, 4)))
         }
         fn decode_step(
             &mut self,
             _weights: &ModelWeights,
             _ffn: &dyn larql_inference::ffn::FfnBackend,
             _token_id: u32,
-        ) -> Option<Array2<f32>> {
+        ) -> Result<Array2<f32>, EngineError> {
             self.decode_calls += 1;
-            Some(Array2::zeros((1, 4)))
+            Ok(Array2::zeros((1, 4)))
         }
         fn memory_bytes(&self) -> usize {
             0
@@ -796,14 +983,14 @@ mod compliance_tests {
         // Build a separate &mut binding for the `prefill_quant` call.
         let mut weights_for_q4k = larql_inference::test_utils::make_test_weights();
         let out = engine.prefill_quant(&mut weights_for_q4k, &ffn, &index, &[1, 2, 3], &*backend);
-        assert!(out.is_some());
+        assert!(out.is_ok());
         assert_eq!(
             engine.prefill_calls, 1,
             "default prefill_quant must call prefill"
         );
 
         let out = engine.decode_step_quant(&mut weights_for_q4k, &ffn, &index, 4, &*backend);
-        assert!(out.is_some());
+        assert!(out.is_ok());
         assert_eq!(
             engine.decode_calls, 1,
             "default decode_step_quant must call decode_step"

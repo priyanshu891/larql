@@ -65,6 +65,22 @@ impl VectorIndex {
             return None;
         }
 
+        // Warmed cache fast path — matches `gate_knn_mmap_fast`. Without
+        // this, f16-stored gate vectors get re-decoded via `resolve_gate`
+        // on every call, costing ~7-8 ms/layer of redundant f16→f32 work.
+        {
+            let warmed = self.gate.warmed_gates.read().unwrap();
+            if let Some(Some(ref data)) = warmed.get(layer) {
+                if data.len() == num_features * self.hidden_size {
+                    let view =
+                        ArrayView2::from_shape((num_features, self.hidden_size), data.as_slice())
+                            .unwrap();
+                    let scores = gemv(&view, residual);
+                    return Some(Self::top_k_from_scores(&scores, top_k));
+                }
+            }
+        }
+
         // Get gate data as contiguous f32 (from mmap or warmed cache)
         let gate_data: &[f32];
         let _owned: Vec<f32>;
@@ -436,6 +452,50 @@ mod tests {
     fn gate_walk_returns_none_when_num_features_zero() {
         let v = VectorIndex::empty(1, 4);
         assert!(v.gate_walk(0, &array![1.0, 2.0, 3.0, 4.0], 1).is_none());
+    }
+
+    /// `gate_walk` must consult `warmed_gates` before falling back to
+    /// `resolve_gate`. Without this the f16-mmap path re-decodes f16→f32
+    /// on every call — measured at ~7–8 ms/layer of redundant work on
+    /// Gemma 3 4B, accounting for the 7.6× gap vs `gate_knn`.
+    ///
+    /// Test setup: f16 storage + populated warmed cache with values that
+    /// differ from what `resolve_gate` would return. If the warmed cache
+    /// is consulted, the result reflects the warmed values.
+    #[test]
+    fn gate_walk_consults_warmed_cache_before_resolve_gate() {
+        use crate::index::types::GateLayerSlice;
+        // Dummy f16 mmap so storage.gate_layer_slice is populated; the
+        // warmed cache fast path short-circuits before any mmap is read.
+        let mmap = memmap2::MmapOptions::new()
+            .len(24) // 3 features × 4 hidden × 2 bytes (f16)
+            .map_anon()
+            .unwrap()
+            .make_read_only()
+            .unwrap();
+        let v = VectorIndex::new_mmap(
+            mmap,
+            vec![GateLayerSlice {
+                float_offset: 0,
+                num_features: 3,
+            }],
+            crate::config::dtype::StorageDtype::F16,
+            None,
+            1,
+            4,
+        );
+        // Populate warmed cache directly: f0 dot = 1, f1 dot = 4, f2 dot = 9.
+        v.gate.warmed_gates.write().unwrap()[0] = Some(vec![
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 2.0, 0.0, 0.0, //
+            0.0, 0.0, 3.0, 0.0, //
+        ]);
+
+        let q = array![1.0, 2.0, 3.0, 4.0];
+        let hits = v.gate_walk(0, &q, 2).expect("warmed cache path");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].0, 2, "f2 wins (dot = 9)");
+        assert!((hits[0].1 - 9.0).abs() < 1e-6);
     }
 
     // ── gate_knn_expert ──────────────────────────────────────────

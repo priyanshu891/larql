@@ -5,7 +5,9 @@
 //! baseline on Gemma 3 4B, validated 2026-04-23).
 
 pub mod compute;
+pub(crate) mod dispatch;
 pub mod engine;
+pub(crate) mod helpers;
 pub mod store;
 pub mod walk;
 

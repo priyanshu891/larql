@@ -235,7 +235,12 @@ pub fn compare_many(
 
 // ── Metrics ────────────────────────────────────────────────────────────────
 
-fn metrics_from_logits(
+/// Public KL/cosine/argmax metrics from two final-position logit vectors.
+///
+/// Used by `compare_prompt` internally and by the
+/// `contract_classify_cached_ffn` experiment to compare cached-vs-uncached
+/// forward passes against the same vindex.
+pub fn metrics_from_logits(
     prompt: &str,
     seq_len: usize,
     logits_ref: &[f32],

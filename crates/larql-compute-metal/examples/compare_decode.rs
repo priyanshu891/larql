@@ -1,14 +1,14 @@
 //! Q4_K decode benchmark: measures actual decode_token latency with KV cache.
 //!
 //! This is the production decode path: Q4_K QKV → KV cache attend → Q4_K O → Q4_0 FFN.
-//! Usage: cargo run --release --features metal -p larql-compute --example compare_decode
+//! Usage: cargo run --release --features gpu -p larql-compute --example compare_decode
 
 extern crate blas_src;
 
 fn main() {
     #[cfg(not(target_os = "macos"))]
     {
-        println!("Run on macOS with --features metal");
+        println!("Run on macOS with --features gpu");
     }
 
     #[cfg(target_os = "macos")]

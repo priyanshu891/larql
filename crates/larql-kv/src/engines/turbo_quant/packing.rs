@@ -13,9 +13,19 @@ pub fn pack_indices(indices: &[u8], bits: u8, out: &mut Vec<u8>) {
 
 /// Unpack indices from a byte buffer.
 pub fn unpack_indices(data: &[u8], count: usize, bits: u8) -> Vec<u8> {
+    let mut result = Vec::with_capacity(count);
+    unpack_indices_into(data, count, bits, &mut result);
+    result
+}
+
+/// Unpack into a caller-provided buffer (cleared and resized).
+/// Codec hot-path entry point — hoists the per-call Vec alloc out.
+pub fn unpack_indices_into(data: &[u8], count: usize, bits: u8, out: &mut Vec<u8>) {
+    out.clear();
+    out.reserve(count);
     match bits {
-        4 => unpack_4bit(data, count),
-        3 => unpack_3bit(data, count),
+        4 => unpack_4bit_into(data, count, out),
+        3 => unpack_3bit_into(data, count, out),
         _ => panic!("unsupported bit width: {bits}"),
     }
 }
@@ -37,8 +47,7 @@ fn pack_4bit(indices: &[u8], out: &mut Vec<u8>) {
     }
 }
 
-fn unpack_4bit(data: &[u8], count: usize) -> Vec<u8> {
-    let mut result = Vec::with_capacity(count);
+fn unpack_4bit_into(data: &[u8], count: usize, result: &mut Vec<u8>) {
     for (i, &byte) in data.iter().enumerate() {
         let lo = byte & 0x0F;
         let hi = (byte >> 4) & 0x0F;
@@ -48,7 +57,6 @@ fn unpack_4bit(data: &[u8], count: usize) -> Vec<u8> {
         }
     }
     result.truncate(count);
-    result
 }
 
 fn pack_3bit(indices: &[u8], out: &mut Vec<u8>) {
@@ -64,8 +72,7 @@ fn pack_3bit(indices: &[u8], out: &mut Vec<u8>) {
     }
 }
 
-fn unpack_3bit(data: &[u8], count: usize) -> Vec<u8> {
-    let mut result = Vec::with_capacity(count);
+fn unpack_3bit_into(data: &[u8], count: usize, result: &mut Vec<u8>) {
     for chunk in data.chunks(3) {
         let mut bits: u32 = 0;
         for (j, &byte) in chunk.iter().enumerate() {
@@ -79,7 +86,6 @@ fn unpack_3bit(data: &[u8], count: usize) -> Vec<u8> {
         }
     }
     result.truncate(count);
-    result
 }
 
 #[cfg(test)]

@@ -5,6 +5,48 @@
 //! the vindex exposes). `Some(k)` selects the sparse walk path
 //! (gate KNN → top-K up dot products → GEGLU → K down accumulations).
 
+/// Top-K feature selector for the sparse walk.
+///
+/// The current production walk picks the top-K features by gate score.
+/// But "gate score" is only one input to per-feature contribution to
+/// the residual; the full contribution is `silu(gate) × up_dot ×
+/// down_row`. A small-gate-score feature with a large `‖down_row‖` may
+/// move the residual more than a large-gate-score feature with a tiny
+/// `‖down_row‖`.
+///
+/// This enum lets the walk rank features by quantities other than gate
+/// score alone, to test the selection-vs-coverage hypothesis at low K.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FeatureSelector {
+    /// Top-K by `|gate_score|`. Default; matches existing behaviour.
+    #[default]
+    GateOnly,
+    /// Top-K by `|gate_score × ‖down_row‖|`. Importance-weighted by the
+    /// down-projection's row norm — a static quantity known at index
+    /// build time.
+    GateXDownNorm,
+    /// Top-K by `|gate_score × ‖up_row‖ × ‖down_row‖|`. Full triple
+    /// product of static-side norms; captures maximum possible
+    /// contribution per feature.
+    GateXUpDownNorm,
+    /// Top-K by `|gate_score × up_score|`. Prompt-conditional through
+    /// both gate and up — the up_score is `⟨up_row, x⟩` at this
+    /// position, not a static norm. Costs a second batched gemv to
+    /// compute all up scores, so candidate selection cost approaches
+    /// the cost of half the FFN. Tests whether prompt-conditional
+    /// ranking buys correctness at low K.
+    GateXUpScore,
+    /// Top-K by `|silu(gate) × up_score × ‖down_row‖|` — the actual
+    /// upper bound on per-feature contribution magnitude (modulo
+    /// activation nonlinearity). Combines all three signals: gate
+    /// (prompt-conditional), up (prompt-conditional), down norm
+    /// (static).
+    ActXUpScoreXDownNorm,
+    /// Top-K random. Control — tells us how much *any* informed
+    /// selection beats no selection.
+    Random,
+}
+
 #[derive(Debug, Clone)]
 pub struct WalkFfnConfig {
     /// Per-layer K. None = dense walk (all features). Some(k) = top-K sparse.
@@ -12,6 +54,20 @@ pub struct WalkFfnConfig {
     /// Skip features whose |activation| falls below this threshold.
     /// 0.0 preserves dense equivalence.
     pub activation_floor: f32,
+    /// When true, skip the full-K gemv fast path in `walk_ffn_sparse`
+    /// and force the per-position walk to run even when K ≥ 80% of
+    /// num_features. Used to measure the walk paradigm at faithful K
+    /// without the dispatch silently failing over to dense gemv.
+    pub force_walk: bool,
+    /// Top-K feature selector. Default: `GateOnly` (production).
+    pub selector: FeatureSelector,
+    /// Optional per-layer feature pool. When set, the top-K selection
+    /// at each layer is restricted to features whose index appears in
+    /// `pool_per_layer[layer]`. Used to simulate the two-stage walk:
+    /// cell-conditional pool (precomputed offline from a residual-cell
+    /// clustering) + within-pool gate-score top-K. When set, also
+    /// implies `force_walk` semantics (the gemv fast path is skipped).
+    pub pool_per_layer: Option<std::sync::Arc<Vec<Vec<usize>>>>,
 }
 
 impl WalkFfnConfig {
@@ -21,6 +77,9 @@ impl WalkFfnConfig {
         Self {
             k_per_layer: vec![None; num_layers],
             activation_floor: 0.0,
+            force_walk: false,
+            selector: FeatureSelector::default(),
+            pool_per_layer: None,
         }
     }
 
@@ -29,6 +88,9 @@ impl WalkFfnConfig {
         Self {
             k_per_layer: vec![Some(k); num_layers],
             activation_floor: 0.0,
+            force_walk: false,
+            selector: FeatureSelector::default(),
+            pool_per_layer: None,
         }
     }
 
@@ -42,12 +104,33 @@ impl WalkFfnConfig {
         Self {
             k_per_layer,
             activation_floor: 0.0,
+            force_walk: false,
+            selector: FeatureSelector::default(),
+            pool_per_layer: None,
         }
     }
 
     /// Set the activation magnitude floor. Default 0.0 (no skip).
     pub fn with_floor(mut self, floor: f32) -> Self {
         self.activation_floor = floor;
+        self
+    }
+
+    /// Force the per-position walk even at full-K. See `force_walk`.
+    pub fn with_force_walk(mut self, force: bool) -> Self {
+        self.force_walk = force;
+        self
+    }
+
+    /// Override the top-K feature selector. See `FeatureSelector`.
+    pub fn with_selector(mut self, selector: FeatureSelector) -> Self {
+        self.selector = selector;
+        self
+    }
+
+    /// Attach a per-layer pool restriction. See `pool_per_layer`.
+    pub fn with_pool_per_layer(mut self, pool: std::sync::Arc<Vec<Vec<usize>>>) -> Self {
+        self.pool_per_layer = Some(pool);
         self
     }
 
@@ -78,6 +161,9 @@ impl Default for WalkFfnConfig {
         Self {
             k_per_layer: Vec::new(),
             activation_floor: 0.0,
+            force_walk: false,
+            selector: FeatureSelector::default(),
+            pool_per_layer: None,
         }
     }
 }

@@ -18,6 +18,14 @@ thiserror = { workspace = true }
 safetensors = "0.7"
 memmap2 = "0.9"
 
+[features]
+default = []
+# Synthetic `ModelWeights` builders for downstream test crates. Off by
+# default so production builds never compile the fixture code. Enable
+# from a consumer's `[dev-dependencies]` entry, e.g.
+# `larql-models = { path = "../larql-models", features = ["test-utils"] }`.
+test-utils = []
+
 [dev-dependencies]
 criterion = "0.5"
 tempfile = "3"

@@ -83,8 +83,8 @@ LM-head path resolution (which kernel fires per next-token):
 | `residual.rs` | RMS norm, layer norm |
 | `trace/` | Residual stream decomposition and tiered storage |
 | `vindex/` | `open_inference_vindex` (strict loader) + `WalkFfn` (mmap'd FFN) + `q4k_forward/` |
-| `kv_engine.rs` | `KvEngine` trait + `EngineInfo` + `DecodeStageSummary` — abstract dispatch surface shared with `larql-kv` (engine impls live there) |
-| `kv_dispatch/` (`mod.rs`, `cpu.rs`, `metal.rs`, `helpers.rs`; future: `vulkan.rs`, `cuda.rs`) | `KvDispatch` per-layer-intent trait (sync) + `EngineBackend: ComputeBackend + KvDispatch` umbrella; `CpuBackend` and `MetalBackend` impls; `helpers::kv_prefill_via_dispatch` / `kv_decode_step_via_dispatch` (sync) + `_async` variants drive the per-layer prefill/decode loop. Spec: [`compute-backend-redesign.md`](docs/specs/compute-backend-redesign.md). |
+| `kv_engine.rs` | `KvEngine` trait + `EngineInfo` + `DecodeStageSummary` — abstract dispatch surface shared with `larql-kv` (engine impls live there). `DecodeStageSummary` now includes W10's `avg_state_capture_us` / `avg_state_materialise_us` / `avg_state_append_us` timers. |
+| `kv_dispatch/` (`mod.rs`, `cpu.rs`, `metal.rs`, `helpers.rs`; future: `vulkan.rs`, `cuda.rs`) | `KvDispatch` per-layer-intent trait (sync) + `EngineBackend: ComputeBackend + KvDispatch` umbrella; `CpuBackend` and `MetalBackend` impls; `helpers::kv_prefill_via_dispatch` / `kv_decode_step_via_dispatch` (sync) + `_async` variants drive the per-layer prefill/decode loop. W10 adds `coarse_decode_step_with_state_masked` + `read_kv_row_at` on the trait. Spec: [`compute-backend-redesign.md`](docs/specs/compute-backend-redesign.md). |
 | `async_compute_backend/` (`mod.rs`, `cpu.rs`, `metal.rs`; future: `vulkan.rs`, `cuda.rs`) | `AsyncComputeBackend: ComputeBackend + KvDispatch + Send` sibling trait — deferred-dispatch intent surface with `AttentionHandle` / `ResidualUploadHandle` for one-command-buffer-per-decode-step batching on GPU backends. CPU is a degenerate `Ready*` wrapper (parity reference). Backends live as submodules so adding Vulkan/CUDA is a single new file. Spec: [`async-compute-backend.md`](docs/specs/async-compute-backend.md). |
 | `experts/` | WASM expert dispatcher and registry |
 | `chat/` | Jinja-driven chat templates loaded from vindex |
@@ -319,6 +319,20 @@ larql-inference   Forward pass, attention, backends, WalkFfn
 | [docs/adr/003](docs/adr/003-cached-layer-graph.md) | Cached layer graph for template-fixed layers |
 | [docs/adr/004](docs/adr/004-predict-honest.md) | predict_honest — production pipeline with per-layer params |
 | [docs/adr/005](docs/adr/005-per-layer-graph.md) | PerLayerGraph — adaptive per-layer strategy |
+
+### Engine + State Policy specs
+
+The KV-engine taxonomy and W10 / state-bridge work live in this
+crate's `docs/specs/` directory. Read in this order:
+
+| Spec | Role |
+|------|------|
+| [`state-policy.md`](../larql-kv/docs/state-policy.md) | Engine identity = `(canonical_state, derivative_state, contract)`. The vocabulary every engine spec inherits. |
+| [`engine-state-vs-execution.md`](docs/specs/engine-state-vs-execution.md) | The orthogonal cut: engine identity vs execution dispatch. §11 documents W10's mask cascade as a worked example. |
+| [`kv-engine-unification.md`](docs/specs/kv-engine-unification.md) | The `KvEngine` trait surface. §4.4 documents W10's `StateDumpMask` + `read_kv_row_at` widening. |
+| [`zone-engine.md`](docs/specs/zone-engine.md) | **Top-level composer.** Sequences PREDICT / WALK / CACHE zones between choke points. |
+| [`layer-engine.md`](docs/specs/layer-engine.md) v0.4 | Inner per-layer composer for WALK zones (subsumed under ZoneEngine). |
+| [`markov-residual-engine.md`](docs/specs/markov-residual-engine.md), [`markov-residual-codec-engine.md`](docs/specs/markov-residual-codec-engine.md), [`unlimited-context-engine.md`](docs/specs/unlimited-context-engine.md), [`standard-engine.md`](docs/specs/standard-engine.md), [`turbo-quant-engine.md`](docs/specs/turbo-quant-engine.md), [`apollo-engine.md`](docs/specs/apollo-engine.md), [`no-cache-engine.md`](docs/specs/no-cache-engine.md), [`boundary-kv-engine.md`](docs/specs/boundary-kv-engine.md), [`boundary-per-layer-engine.md`](docs/specs/boundary-per-layer-engine.md) | Per-engine contracts; each marks its W10 opt-in path where applicable. |
 
 ## License
 

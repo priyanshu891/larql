@@ -4,7 +4,7 @@
 //! a CPU reference implementation. Tests both correctness and
 //! that the shader compiles and dispatches successfully.
 //!
-//! Run with: cargo test -p larql-compute --features metal
+//! Run with: cargo test -p larql-compute --features gpu
 
 #![cfg(target_os = "macos")]
 

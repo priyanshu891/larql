@@ -79,9 +79,8 @@ jobs:
       # files for the rationale.
       - name: Install protoc (Windows)
         if: runner.os == 'Windows'
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: choco install protoc -y --no-progress
 
       - name: Cache cargo registry + build artefacts
         uses: actions/cache@v5
@@ -101,7 +100,7 @@ jobs:
         if: runner.os != 'macOS'
         run: cargo check -p larql-cli --bins --tests --no-default-features
 
-      - name: Check (default features incl. metal) on macOS
+      - name: Check (default features incl. gpu) on macOS
         if: runner.os == 'macOS'
         run: cargo check -p larql-cli --bins --tests
 

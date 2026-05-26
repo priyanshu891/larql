@@ -4,6 +4,7 @@
 //! the `TurboQuantEngine` implementation and the `TurboQuant` codec struct.
 
 pub mod codebooks;
+pub(crate) mod dispatch;
 pub mod engine;
 pub mod lloyd_max;
 pub mod packing;

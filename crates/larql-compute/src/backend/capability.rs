@@ -86,4 +86,17 @@ pub enum Capability {
     /// exists so future "compute backend that doesn't store K/V at all"
     /// configurations (e.g., a router proxy) can opt out.
     KvHandleNative,
+    /// Backend implements [`crate::ComputeBackend::prepare_ple_inputs`]
+    /// for Per-Layer Embeddings (Gemma 4 E2B and successors). Without
+    /// this, the call is a no-op and the PLE input table is never
+    /// uploaded; engines should skip the precompute work entirely.
+    PerLayerEmbeddings,
+    /// Backend can run a single attention layer on the GPU and return
+    /// the post-attention hidden state to the caller, so the caller can
+    /// run FFN on CPU (the hybrid "GPU attention + vindex walk FFN"
+    /// pipeline). Probed by `layer_graph::hybrid::predict_hybrid_gpu`;
+    /// backends that don't claim this fall back to the full-CPU honest
+    /// predict path. The backing KV cache is owned by the backend and
+    /// is opaque to the engine.
+    HybridAttention,
 }

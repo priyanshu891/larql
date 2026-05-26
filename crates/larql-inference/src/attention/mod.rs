@@ -1,9 +1,14 @@
-//! Attention computation — RoPE, GQA, causal masking, GPU dispatch.
+//! Attention computation — RoPE + GQA primitives moved to
+//! `larql_compute::attention` (ADR-0022 Step 2d). This module retains
+//! the engine-side dispatch (`block`, `decode`, `gpu` submodules) and
+//! re-exports substrate types + math so existing `crate::attention::*`
+//! paths continue to work.
 //!
 //! Submodules:
-//! - `rope`: Rotary Position Embeddings (full and partial rotation)
-//! - `gqa`: Grouped-Query Attention with BLAS-fused dot products
+//! - `rope` (shim): re-exports `larql_compute::attention::rope`
+//! - `gqa` (shim): re-exports `larql_compute::attention::gqa`
 //! - `block`: CPU attention block (norm → proj → RoPE → GQA → O → residual)
+//! - `decode`: per-step KV-cached decode dispatch
 //! - `gpu`: GPU-accelerated attention, KV-capture, Q4 projection
 
 pub mod block;
@@ -12,26 +17,7 @@ pub mod gpu;
 pub mod gqa;
 pub mod rope;
 
-use ndarray::Array2;
-
-/// Per-head attention weights for the last token position.
-pub struct AttentionWeights {
-    /// Per-head attention distribution for the last sequence position.
-    /// `heads[h][j]` = attention weight from last token to position j.
-    pub heads: Vec<Vec<f32>>,
-}
-
-/// Per-head attention weights for every query position.
-///
-/// `heads[h][i][j]` = attention weight from query position `i` to source
-/// position `j`. Rows are padded to the full sequence length; causal-future
-/// entries are zero.
-pub struct AttentionAllWeights {
-    pub heads: Vec<Vec<Vec<f32>>>,
-}
-
-/// Shared KV pair: post-RoPE K and post-V-norm V from a source layer.
-pub type SharedKV = (Array2<f32>, Array2<f32>);
+pub use larql_compute::attention::{AttentionAllWeights, AttentionWeights, SharedKV};
 
 // ── Re-exports: preserve `crate::attention::*` paths ──
 

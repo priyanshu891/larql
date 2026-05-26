@@ -64,3 +64,10 @@ debug = "line-tables-only"
 
 [profile.test.package."*"]
 debug = false
+
+# Temporary: enable line tables in release builds so samply / flamegraph
+# can resolve symbol names. Cheap (no full debug info; just symbols
+# + line numbers). Remove once profiling is done.
+[profile.release]
+debug = "line-tables-only"
+split-debuginfo = "packed"

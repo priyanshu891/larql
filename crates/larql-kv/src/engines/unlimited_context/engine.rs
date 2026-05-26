@@ -22,13 +22,14 @@ use serde::Serialize;
 
 use super::checkpoint_store::CheckpointStore;
 use super::extend::{
-    empty_prior, rs_extend_from_checkpoint_backend, rs_extend_from_checkpoint_q4k,
+    empty_prior, rs_extend_from_checkpoint_backend, rs_extend_from_checkpoint_quant,
 };
 use super::token_archive::TokenArchive;
 use crate::engines::markov_residual::ensure_attn_tensors_dequantised;
 use crate::{EngineInfo, KvEngine};
 use larql_inference::attention::SharedKV;
 use larql_inference::ffn::FfnBackend;
+use larql_inference::kv_engine::EngineError;
 use larql_inference::model::ModelWeights;
 
 // ─── EngineStats ─────────────────────────────────────────────────────────────
@@ -62,13 +63,37 @@ pub struct UnlimitedContextEngine {
     pub checkpoints: CheckpointStore,
     pub archive: TokenArchive,
 
-    current_window_id: usize,
-    current_window_tokens: Vec<u32>,
-    current_window_kv: Option<Vec<SharedKV>>,
-    abs_offset: usize,
+    pub(super) current_window_id: usize,
+    pub(super) current_window_tokens: Vec<u32>,
+    /// Per-layer K/V for the current (partial) window.
+    ///
+    /// Two layouts coexist:
+    /// - **Pre-allocated** (dispatch hot path): `Array2` is shaped
+    ///   `[window_size, kv_dim]` with only the first
+    ///   `current_window_kv_len` rows valid; the rest are zeros. Used by
+    ///   `try_prefill_via_dispatch` / `decode_step_via_dispatch` so the
+    ///   per-step append is one `slice_mut().assign(row)`, not a fresh
+    ///   `Array2::zeros((n+1, kv_dim)) + slice-copy`.
+    /// - **Narrow** (CPU walk path): `Array2` is shaped `[n, kv_dim]`,
+    ///   matching the arrays returned by `rs_extend_from_checkpoint_*`.
+    ///   `current_window_kv_len` equals `n` here, so readers can treat
+    ///   the two layouts uniformly via the counter.
+    ///
+    /// Readers that need the logical length **must** use
+    /// `current_window_kv_len`, not `k.shape()[0]`.
+    pub(super) current_window_kv: Option<Vec<SharedKV>>,
+    /// Logical row count for `current_window_kv`. See field doc above.
+    pub(super) current_window_kv_len: usize,
+    pub(super) abs_offset: usize,
     /// Hidden state at the last processed token; set by `process()`.
-    last_hidden: Option<Array2<f32>>,
-    backend: Box<dyn EngineBackend>,
+    pub(super) last_hidden: Option<Array2<f32>>,
+    pub(super) backend: Box<dyn EngineBackend>,
+    pub(super) profiling: bool,
+    pub(super) profile: crate::profiler::EngineProfiler,
+    /// W1-GPU: handle into the backend's K/V cache, populated when
+    /// prefill routes through `coarse_prefill_with_state`. `None` =
+    /// legacy CPU walk path.
+    pub(super) kv_handle: Option<larql_inference::KvHandle>,
 }
 
 impl UnlimitedContextEngine {
@@ -84,10 +109,19 @@ impl UnlimitedContextEngine {
             current_window_id: 0,
             current_window_tokens: Vec::new(),
             current_window_kv: None,
+            current_window_kv_len: 0,
             abs_offset: 0,
             last_hidden: None,
             backend,
+            profiling: false,
+            profile: crate::profiler::EngineProfiler::default(),
+            kv_handle: None,
         }
+    }
+
+    pub fn with_profiling(mut self, enabled: bool) -> Self {
+        self.profiling = enabled;
+        self
     }
 
     /// Feed tokens into the engine. Windows auto-close when they fill.
@@ -175,9 +209,11 @@ impl UnlimitedContextEngine {
         }
     }
 
-    /// CPU Q4K equivalent of `process()` — uses `rs_extend_from_checkpoint_q4k`
-    /// (WalkFfn for FFN) instead of the f32-backed `rs_extend_from_checkpoint_backend`.
-    fn process_q4k(
+    /// Quant-aware equivalent of `process()` — uses
+    /// `rs_extend_from_checkpoint_quant` (WalkFfn for FFN; dispatches on
+    /// the vindex's format) instead of the f32-backed
+    /// `rs_extend_from_checkpoint_backend`.
+    fn process_quant(
         &mut self,
         weights: &ModelWeights,
         index: &VectorIndex,
@@ -189,7 +225,7 @@ impl UnlimitedContextEngine {
             let free = self.window_size - self.current_window_tokens.len();
             let take = remaining.len().min(free);
             let (chunk, rest) = remaining.split_at(take);
-            self.extend_current_q4k(weights, index, chunk, backend)?;
+            self.extend_current_quant(weights, index, chunk, backend)?;
             remaining = rest;
             if self.current_window_tokens.len() >= self.window_size {
                 self.close_window();
@@ -198,7 +234,7 @@ impl UnlimitedContextEngine {
         Some(())
     }
 
-    fn extend_current_q4k(
+    fn extend_current_quant(
         &mut self,
         weights: &ModelWeights,
         index: &VectorIndex,
@@ -223,17 +259,36 @@ impl UnlimitedContextEngine {
         };
 
         let abs_start = self.abs_offset + self.current_window_tokens.len();
-        let out = rs_extend_from_checkpoint_q4k(weights, index, chunk, prior, abs_start, backend)?;
+        let prof = self.profiling.then_some(&mut self.profile);
+        let out = rs_extend_from_checkpoint_quant(
+            weights, index, chunk, prior, abs_start, backend, prof,
+        )?;
 
         self.last_hidden = Some(out.last_hidden);
+        // CPU walk path returns narrow `[n, kv_dim]` arrays — counter
+        // equals shape[0] here. Hot path (`decode_step_via_dispatch`)
+        // will re-normalise to pre-allocated `[window_size, kv_dim]`
+        // on the next prefill if needed; mixed-mode within a single
+        // window isn't supported (and isn't reachable today since
+        // `kv_handle` gates the two paths).
+        self.current_window_kv_len = out.kv_cache.first().map_or(0, |(k, _)| k.shape()[0]);
         self.current_window_kv = Some(out.kv_cache);
         self.current_window_tokens.extend_from_slice(chunk);
         Some(())
     }
 
     fn current_kv_bytes(&self) -> usize {
+        // W8: count only the logically valid rows. Buffers may be
+        // pre-allocated `[window_size, kv_dim]` so `k.len()` overstates
+        // by `(window_size - current_window_kv_len) * kv_dim`.
+        let rows = self.current_window_kv_len;
+        if rows == 0 {
+            return 0;
+        }
         self.current_window_kv.as_ref().map_or(0, |kv| {
-            kv.iter().map(|(k, v)| (k.len() + v.len()) * 4).sum()
+            kv.iter()
+                .map(|(k, v)| (k.shape()[1] + v.shape()[1]) * rows * 4)
+                .sum()
         })
     }
 
@@ -265,26 +320,77 @@ impl UnlimitedContextEngine {
         )?;
 
         self.last_hidden = Some(out.last_hidden);
+        // CPU walk path: see comment on extend_current_quant — narrow
+        // arrays, counter == shape[0].
+        self.current_window_kv_len = out.kv_cache.first().map_or(0, |(k, _)| k.shape()[0]);
         self.current_window_kv = Some(out.kv_cache);
         self.current_window_tokens.extend_from_slice(chunk);
         Some(())
     }
 
-    fn close_window(&mut self) {
-        let kv = match self.current_window_kv.take() {
-            Some(kv) => kv,
-            None => return,
+    pub(super) fn close_window(&mut self) {
+        // W10 Phase B: under HOnly the engine-side window shadow is
+        // None; pull the last position's K/V back from the backend
+        // (Metal kv cache) via KvDispatch::read_kv_row_at. Without
+        // HOnly this branch never fires (kv is always Some) and we
+        // slice the engine-side shadow as before.
+        let n = self.current_window_kv_len;
+        let last_kv: Vec<SharedKV> = match self.current_window_kv.take() {
+            Some(kv) => {
+                if n == 0 {
+                    Vec::new()
+                } else {
+                    kv.iter()
+                        .map(|(k, v)| {
+                            let last_k = k.slice(ndarray::s![n - 1..n, ..]).to_owned();
+                            let last_v = v.slice(ndarray::s![n - 1..n, ..]).to_owned();
+                            (last_k, last_v)
+                        })
+                        .collect()
+                }
+            }
+            None => {
+                // No CPU shadow — engine ran under HOnly. Read the
+                // last position's K/V back from the backend's kv cache
+                // for the checkpoint. If the backend doesn't support
+                // this path (older Metal builds, CPU), we have to
+                // emit an empty checkpoint; the engine's continuation
+                // will need to re-run prefill from the archived tokens
+                // rather than the K/V checkpoint. This is the cost of
+                // running HOnly without a backend-side snapshot
+                // affordance.
+                if n == 0 {
+                    Vec::new()
+                } else if let Some(handle) = self.kv_handle.as_ref() {
+                    let last_pos = n - 1;
+                    let mut rows = Vec::with_capacity(self.last_hidden.as_ref().map_or(0, |h| {
+                        // num_layers proxy: ModelWeights isn't in scope
+                        // here, so we use the existing per-layer count
+                        // exposed by the backend on the first lookup.
+                        let _ = h;
+                        0
+                    }));
+                    let mut layer = 0;
+                    while let Some((k_row, v_row)) = self
+                        .backend
+                        .as_ref()
+                        .read_kv_row_at(handle, layer, last_pos)
+                    {
+                        let kv_dim = k_row.len();
+                        let k = Array2::from_shape_vec((1, kv_dim), k_row)
+                            .expect("read_kv_row_at returned mismatched length");
+                        let v = Array2::from_shape_vec((1, kv_dim), v_row)
+                            .expect("read_kv_row_at returned mismatched length");
+                        rows.push((k, v));
+                        layer += 1;
+                    }
+                    rows
+                } else {
+                    return;
+                }
+            }
         };
-
-        let last_kv: Vec<SharedKV> = kv
-            .iter()
-            .map(|(k, v)| {
-                let n = k.shape()[0];
-                let last_k = k.slice(ndarray::s![n - 1..n, ..]).to_owned();
-                let last_v = v.slice(ndarray::s![n - 1..n, ..]).to_owned();
-                (last_k, last_v)
-            })
-            .collect();
+        self.current_window_kv_len = 0;
 
         let window_len = self.current_window_tokens.len();
         let abs_end = self.abs_offset + window_len - 1;
@@ -328,9 +434,19 @@ impl KvEngine for UnlimitedContextEngine {
         weights: &ModelWeights,
         _ffn: &dyn FfnBackend,
         token_ids: &[u32],
-    ) -> Option<Array2<f32>> {
-        self.process(weights, token_ids)?;
-        self.last_hidden.clone()
+    ) -> Result<Array2<f32>, EngineError> {
+        if token_ids.is_empty() {
+            return Err(EngineError::EmptyPrompt);
+        }
+        self.process(weights, token_ids)
+            .ok_or_else(|| EngineError::BackendFailure {
+                details: "process returned None during prefill".into(),
+            })?;
+        self.last_hidden
+            .clone()
+            .ok_or_else(|| EngineError::BackendFailure {
+                details: "last_hidden missing after prefill".into(),
+            })
     }
 
     fn decode_step(
@@ -338,9 +454,16 @@ impl KvEngine for UnlimitedContextEngine {
         weights: &ModelWeights,
         _ffn: &dyn FfnBackend,
         token_id: u32,
-    ) -> Option<Array2<f32>> {
-        self.process(weights, &[token_id])?;
-        self.last_hidden.clone()
+    ) -> Result<Array2<f32>, EngineError> {
+        self.process(weights, &[token_id])
+            .ok_or_else(|| EngineError::BackendFailure {
+                details: "process returned None during decode_step".into(),
+            })?;
+        self.last_hidden
+            .clone()
+            .ok_or_else(|| EngineError::BackendFailure {
+                details: "last_hidden missing after decode_step".into(),
+            })
     }
 
     fn memory_bytes(&self) -> usize {
@@ -355,11 +478,22 @@ impl KvEngine for UnlimitedContextEngine {
         self.checkpoints.total_bytes() + self.archive.total_bytes()
     }
 
-    /// Q4K prefill — runs the windowed-checkpoint extension regardless of
-    /// backend. Engines that want the backend's fused fast path must
-    /// select `StandardEngine` explicitly; this engine's whole identity
-    /// is window-bounded K/V with checkpoint replay, and bypassing to
-    /// fused would skip every checkpoint we'd otherwise emit.
+    fn stage_summary(&self) -> Option<crate::DecodeStageSummary> {
+        if !self.profiling || self.profile.decode_total.count == 0 {
+            return None;
+        }
+        Some(
+            self.profile
+                .summary("unlimited-context", self.backend.name()),
+        )
+    }
+
+    /// Quant prefill — runs the windowed-checkpoint extension regardless
+    /// of backend or vindex format. W1-GPU: tries `coarse_prefill_with_state`
+    /// first; falls back to the legacy CPU per-layer walk when state
+    /// capture isn't available. The engine's window-checkpoint
+    /// contract is preserved either way: `current_window_kv` is built
+    /// from captured per-layer state (W1-GPU) or computed via walk.
     fn prefill_quant(
         &mut self,
         weights: &mut ModelWeights,
@@ -367,10 +501,24 @@ impl KvEngine for UnlimitedContextEngine {
         index: &VectorIndex,
         token_ids: &[u32],
         backend: &dyn ComputeBackend,
-    ) -> Option<Array2<f32>> {
+    ) -> Result<Array2<f32>, EngineError> {
+        if token_ids.is_empty() {
+            return Err(EngineError::EmptyPrompt);
+        }
+        if let Some(hidden) = self.try_prefill_via_dispatch(weights, index, token_ids) {
+            return Ok(hidden);
+        }
+        self.kv_handle = None;
         ensure_attn_tensors_dequantised(weights, index);
-        self.process_q4k(weights, index, token_ids, backend)?;
-        self.last_hidden.clone()
+        self.process_quant(weights, index, token_ids, backend)
+            .ok_or_else(|| EngineError::BackendFailure {
+                details: "process_quant returned None during prefill_quant".into(),
+            })?;
+        self.last_hidden
+            .clone()
+            .ok_or_else(|| EngineError::BackendFailure {
+                details: "last_hidden missing after prefill_quant".into(),
+            })
     }
 
     fn decode_step_quant(
@@ -380,10 +528,24 @@ impl KvEngine for UnlimitedContextEngine {
         index: &VectorIndex,
         token_id: u32,
         backend: &dyn ComputeBackend,
-    ) -> Option<Array2<f32>> {
+    ) -> Result<Array2<f32>, EngineError> {
+        if self.kv_handle.is_some() {
+            return self
+                .decode_step_via_dispatch(weights, index, token_id)
+                .ok_or_else(|| EngineError::BackendFailure {
+                    details: "decode_step_via_dispatch returned None".into(),
+                });
+        }
         ensure_attn_tensors_dequantised(weights, index);
-        self.process_q4k(weights, index, &[token_id], backend)?;
-        self.last_hidden.clone()
+        self.process_quant(weights, index, &[token_id], backend)
+            .ok_or_else(|| EngineError::BackendFailure {
+                details: "process_quant returned None during decode_step_quant".into(),
+            })?;
+        self.last_hidden
+            .clone()
+            .ok_or_else(|| EngineError::BackendFailure {
+                details: "last_hidden missing after decode_step_quant".into(),
+            })
     }
 
     // ── Executor-aware migration (Phase 2 of engine-state-vs-execution spec) ──
@@ -395,7 +557,7 @@ impl KvEngine for UnlimitedContextEngine {
     // the engine actually dispatches through the supplied backend.
     //
     // Window-close semantics (checkpoint + archive at window boundaries) are
-    // identical to `process_q4k` / `extend_current_q4k` — the executor only
+    // identical to `process_quant` / `extend_current_quant` — the executor only
     // owns per-layer compute; window state is engine state.
     fn prefill_quant_via_executor(
         &mut self,
@@ -404,8 +566,11 @@ impl KvEngine for UnlimitedContextEngine {
         ffn: &dyn FfnBackend,
         index: &VectorIndex,
         token_ids: &[u32],
-    ) -> Option<Array2<f32>> {
+    ) -> Result<Array2<f32>, EngineError> {
         use larql_inference::layer_executor::ExecutorDispatchKind;
+        if token_ids.is_empty() {
+            return Err(EngineError::EmptyPrompt);
+        }
         // Spec §3.4: this engine's state policy (windowed checkpoints) is
         // expressible against per-layer dispatch only. Transparent degrade
         // on fused executors until the Phase 3 refusal contract lands.
@@ -413,8 +578,16 @@ impl KvEngine for UnlimitedContextEngine {
             return self.prefill_quant(weights, ffn, index, token_ids, executor.backend());
         }
         ensure_attn_tensors_dequantised(weights, index);
-        self.process_via_executor(weights, executor, ffn, token_ids)?;
-        self.last_hidden.clone()
+        self.process_via_executor(weights, executor, ffn, token_ids)
+            .ok_or_else(|| EngineError::BackendFailure {
+                details: "process_via_executor returned None during prefill_quant_via_executor"
+                    .into(),
+            })?;
+        self.last_hidden
+            .clone()
+            .ok_or_else(|| EngineError::BackendFailure {
+                details: "last_hidden missing after prefill_quant_via_executor".into(),
+            })
     }
 
     fn decode_step_quant_via_executor(
@@ -424,21 +597,29 @@ impl KvEngine for UnlimitedContextEngine {
         ffn: &dyn FfnBackend,
         index: &VectorIndex,
         token_id: u32,
-    ) -> Option<Array2<f32>> {
+    ) -> Result<Array2<f32>, EngineError> {
         use larql_inference::layer_executor::ExecutorDispatchKind;
         if matches!(executor.dispatch_kind(), ExecutorDispatchKind::Fused) {
             return self.decode_step_quant(weights, ffn, index, token_id, executor.backend());
         }
         ensure_attn_tensors_dequantised(weights, index);
-        self.process_via_executor(weights, executor, ffn, &[token_id])?;
-        self.last_hidden.clone()
+        self.process_via_executor(weights, executor, ffn, &[token_id])
+            .ok_or_else(|| EngineError::BackendFailure {
+                details: "process_via_executor returned None during decode_step_quant_via_executor"
+                    .into(),
+            })?;
+        self.last_hidden
+            .clone()
+            .ok_or_else(|| EngineError::BackendFailure {
+                details: "last_hidden missing after decode_step_quant_via_executor".into(),
+            })
     }
 }
 
 // ── Executor-driven window extension ─────────────────────────────────────────
 
 impl UnlimitedContextEngine {
-    /// Executor-aware analogue of `process_q4k`: feeds tokens into the
+    /// Executor-aware analogue of `process_quant`: feeds tokens into the
     /// current window, auto-closes on fill, drives per-layer compute
     /// through `executor` instead of constructing a local `WalkFfn`.
     fn process_via_executor(
@@ -508,6 +689,8 @@ impl UnlimitedContextEngine {
         }
 
         self.last_hidden = last_hidden;
+        // CPU walk path via executor: kv_cache is narrow arrays.
+        self.current_window_kv_len = kv_cache.first().map_or(0, |(k, _)| k.shape()[0]);
         self.current_window_kv = Some(kv_cache);
         self.current_window_tokens.extend_from_slice(chunk);
         Some(())
@@ -863,6 +1046,34 @@ mod tests {
             .decode_step_quant_via_executor(&mut weights, &executor, &ffn, &index, 2)
             .expect("decode");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
+    }
+
+    /// Drive `rs_extend_from_checkpoint_quant`'s `Some(profiler)` arms
+    /// — covers the per-stage `if timing { ... }` blocks and the
+    /// profiler accumulator at the end of the function.
+    #[test]
+    fn process_quant_with_profiling_populates_summary() {
+        use larql_inference::ffn::NullFfn;
+        use larql_inference::test_utils::make_test_weights;
+        let mut weights = make_test_weights();
+        let index = larql_inference::test_utils::make_test_vindex(&weights);
+        let backend = larql_compute::cpu_backend();
+        let ffn = NullFfn;
+        let mut engine = UnlimitedContextEngine::new(512).with_profiling(true);
+        engine
+            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1], &*backend)
+            .expect("prefill");
+        engine
+            .decode_step_quant(&mut weights, &ffn, &index, 2, &*backend)
+            .expect("decode");
+        let summary = engine
+            .stage_summary()
+            .expect("unlimited_context profiler should populate summary");
+        assert_eq!(summary.engine, "unlimited-context");
+        assert!(summary.steps >= 1);
+        assert!(summary.avg_attention_us > 0.0);
+        assert!(summary.avg_ffn_us > 0.0);
+        assert!(summary.avg_total_decode_us > 0.0);
     }
 
     /// Counting FFN that records every `forward` call. Proves the executor

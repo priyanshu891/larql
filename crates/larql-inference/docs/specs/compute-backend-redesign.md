@@ -480,7 +480,7 @@ reverted attempt — see history note above).
   `KvHandle`, `ResidualHandle`, `CompressionCodec`, plus
   `KvHandleInner` / `ResidualHandleInner` for backend-side allocation.
   Backend impls live in sibling submodules: `cpu.rs`, `metal.rs`
-  (`#[cfg(feature = "metal")]`), and the per-layer prefill/decode
+  (`#[cfg(feature = "gpu")]`), and the per-layer prefill/decode
   drivers in `helpers.rs`.
 - 6 new `Capability` variants in `crates/larql-compute/src/backend/capability.rs`
   (`FusedAttentionStep`, `WindowedAttentionStep`, `NativeKvCodec`,

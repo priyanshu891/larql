@@ -23,10 +23,11 @@ use larql_compute::FullPipelineLayer;
 
 /// Run the prefill phase for streaming Q4 generation.
 ///
-/// `metal_ple_backend` is `Some(metal)` only when (a) the model uses
-/// per-layer embeddings AND (b) `LARQL_METAL_PLE=1` AND (c) we're on
-/// macOS+metal. The PLE-upload closure is invoked once per prompt token.
-#[cfg(all(feature = "metal", target_os = "macos"))]
+/// `upload_ple` is `Some(_)` only when (a) the model uses per-layer
+/// embeddings AND (b) `LARQL_METAL_PLE=1` AND (c) the backend claims
+/// [`Capability::PerLayerEmbeddings`]. The closure captures the
+/// PLE-capable backend; it's invoked once per prompt token before that
+/// token's decode dispatch.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn prefill_for_streaming(
     weights: &ModelWeights,
@@ -38,17 +39,16 @@ pub(super) fn prefill_for_streaming(
     x: &[f32],
     qk_norm_val: bool,
     softcap_val: f32,
-    metal_ple_backend: Option<&larql_compute_metal::MetalBackend>,
-    upload_ple: &dyn Fn(&larql_compute_metal::MetalBackend, u32, &[f32]),
+    upload_ple: Option<super::UploadPleFn>,
 ) -> Result<Vec<f32>, GenerateError> {
     let seq_len = token_ids.len();
 
-    // Branch 1: Per-Layer Embeddings (Metal-only).
-    if let Some(metal) = metal_ple_backend {
+    // Branch 1: Per-Layer Embeddings (PLE-capable backend only).
+    if let Some(upload) = upload_ple {
         let mut last_h = vec![0.0f32; hidden];
         for pos in 0..seq_len {
             let x_pos: Vec<f32> = x[pos * hidden..(pos + 1) * hidden].to_vec();
-            upload_ple(metal, token_ids[pos], &x_pos);
+            upload(token_ids[pos], &x_pos);
             last_h = backend
                 .decode_token(layers, &x_pos, hidden, intermediate)
                 .unwrap_or_else(|| vec![0.0f32; hidden]);
@@ -64,39 +64,6 @@ pub(super) fn prefill_for_streaming(
     }
 
     // Branch 3: standard fused prefill.
-    prefill_kquant_prompt(
-        backend,
-        layers,
-        x,
-        hidden,
-        intermediate,
-        seq_len,
-        qk_norm_val,
-        softcap_val,
-        "GPU Q4 prefill returned no output",
-    )
-}
-
-/// Non-metal build: PLE branch is unreachable (no `MetalBackend`).
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-#[allow(clippy::too_many_arguments)]
-pub(super) fn prefill_for_streaming(
-    weights: &ModelWeights,
-    backend: &dyn ComputeBackend,
-    layers: &[FullPipelineLayer],
-    hidden: usize,
-    intermediate: usize,
-    token_ids: &[u32],
-    x: &[f32],
-    qk_norm_val: bool,
-    softcap_val: f32,
-) -> Result<Vec<f32>, GenerateError> {
-    let seq_len = token_ids.len();
-
-    if weights.has_per_layer_ffn() {
-        return prefill_kquant_moe(weights, backend, layers, hidden, intermediate, token_ids, x);
-    }
-
     prefill_kquant_prompt(
         backend,
         layers,
@@ -180,16 +147,9 @@ mod tests {
         );
     }
 
-    // The non-metal `prefill_for_streaming` doesn't take a `metal_ple`
-    // argument — its branch set is just (per-layer Q4K MoE, standard).
-    // Both paths require backend Q4 support, so CpuBackend short-circuits
-    // through the moe_q4k guard above before reaching the standard
-    // `prefill_kquant_prompt` path.
-
     /// `prefill_for_streaming` standard branch (non-MoE weights) — falls
     /// through `has_per_layer_ffn=false` → calls `prefill_kquant_prompt`,
     /// which propagates the backend's `None` as `PrefillFailed`.
-    #[cfg(not(all(feature = "metal", target_os = "macos")))]
     #[test]
     fn prefill_for_streaming_standard_branch_errors_when_backend_returns_none() {
         let weights = make_test_weights();
@@ -208,6 +168,7 @@ mod tests {
             &x,
             false,
             0.0,
+            None,
         );
         let err = match result {
             Ok(_) => panic!("CpuBackend default prefill_kquant must yield Err"),
@@ -220,7 +181,6 @@ mod tests {
     /// returns `Some(vec![0; seq_len * hidden])` from `prefill_kquant`, the
     /// wrapper unwraps it as `Ok`. Drives the success body of
     /// `prefill_kquant_prompt`.
-    #[cfg(not(all(feature = "metal", target_os = "macos")))]
     #[test]
     fn prefill_for_streaming_standard_branch_succeeds_with_mock_gpu_backend() {
         use crate::test_utils::MockGpuBackend;
@@ -240,6 +200,7 @@ mod tests {
             &x,
             false,
             0.0,
+            None,
         )
         .expect("MockGpuBackend prefill_kquant returns Some");
         assert_eq!(out.len(), seq * weights.hidden_size);

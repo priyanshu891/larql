@@ -1,3 +1,10 @@
+// Clippy's `needless_option_as_deref` lint flags `state_dump.as_deref_mut()`
+// inside the per-layer loops here. The lint is wrong in this context: the
+// loop reuses `state_dump` across iterations, and pattern-matching the
+// `Option<&mut DecodeStateDump>` directly would move it on the first
+// iteration. `as_deref_mut()` re-borrows each iteration without moving.
+#![allow(clippy::needless_option_as_deref)]
+
 use super::*;
 
 mod diag;
@@ -138,7 +145,7 @@ impl MetalBackend {
         moe_fn: Option<&mut dyn FnMut(usize, &[f32]) -> Vec<f32>>,
     ) -> Vec<f32> {
         // Backwards-compat wrapper: forward to the split-aware impl with no
-        // collect callback.
+        // collect callback and no state dump.
         self.decode_token_with_moe_split_fn(
             kv_cache,
             layers,
@@ -153,6 +160,93 @@ impl MetalBackend {
             _rope_base,
             moe_fn,
             None,
+            None,
+            larql_compute::StateDumpMask::Full,
+        )
+    }
+
+    /// Decode one token AND capture per-layer state (W1-GPU step 2).
+    ///
+    /// Same compute path as `decode_token_with_moe_fn` (no MoE; the
+    /// per-layer engines that consume state — markov_residual, codec,
+    /// turbo_quant — target dense-FFN architectures). On exit, `state`
+    /// is populated with per-layer `h_in` (pre-attention residual),
+    /// `k_new` and `v_new` (newly-projected K/V row). Implementation
+    /// forces a commit + CPU readback at the end of each layer so the
+    /// scratch K/V buffers can be sampled before the next layer
+    /// overwrites them; the per-layer-commit overhead (~50µs each ×
+    /// num_layers) is the dominant cost vs the fully-fused
+    /// single-commit path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_token_with_state_dump_fn(
+        &self,
+        kv_cache: &mut ops::kv_cache::KVCache,
+        layers: &[larql_compute::FullPipelineLayer],
+        x: &[f32],
+        hidden: usize,
+        inter: usize,
+        q_dim: usize,
+        kv_dim: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rope_base: f32,
+        state: &mut larql_compute::DecodeStateDump,
+    ) -> Vec<f32> {
+        self.decode_token_with_state_dump_masked_fn(
+            kv_cache,
+            layers,
+            x,
+            hidden,
+            inter,
+            q_dim,
+            kv_dim,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rope_base,
+            state,
+            larql_compute::StateDumpMask::Full,
+        )
+    }
+
+    /// Mask-aware variant of [`Self::decode_token_with_state_dump_fn`].
+    /// W10 Phase B: engines that treat K/V as derivative can pass
+    /// [`larql_compute::StateDumpMask::HOnly`] to skip the K/V staging +
+    /// readback.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_token_with_state_dump_masked_fn(
+        &self,
+        kv_cache: &mut ops::kv_cache::KVCache,
+        layers: &[larql_compute::FullPipelineLayer],
+        x: &[f32],
+        hidden: usize,
+        inter: usize,
+        q_dim: usize,
+        kv_dim: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rope_base: f32,
+        state: &mut larql_compute::DecodeStateDump,
+        mask: larql_compute::StateDumpMask,
+    ) -> Vec<f32> {
+        self.decode_token_with_moe_split_fn(
+            kv_cache,
+            layers,
+            x,
+            hidden,
+            inter,
+            q_dim,
+            kv_dim,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rope_base,
+            None,
+            None,
+            Some(state),
+            mask,
         )
     }
 
@@ -175,7 +269,18 @@ impl MetalBackend {
         _rope_base: f32,
         mut moe_fn: Option<&mut dyn FnMut(usize, &[f32]) -> Vec<f32>>,
         mut moe_collect_fn: Option<&mut dyn FnMut(usize) -> Vec<f32>>,
+        mut state_dump: Option<&mut larql_compute::DecodeStateDump>,
+        state_dump_mask: larql_compute::StateDumpMask,
     ) -> Vec<f32> {
+        // W10 Phase B/C: capture flags. `dump_kv` controls the K/V
+        // staging + readback (skipped under HOnly + None — Metal's own
+        // kv cache still receives the K/V as a side effect for
+        // attention). `dump_h` controls the h_in staging + readback
+        // (skipped under None only — engines using `None` have no
+        // CPU-side use for the residual stream, e.g.
+        // MarkovResidualEngine with no window).
+        let dump_kv = matches!(state_dump_mask, larql_compute::StateDumpMask::Full);
+        let dump_h = !matches!(state_dump_mask, larql_compute::StateDumpMask::None);
         let _gpu_time_token_start = std::time::Instant::now();
         let mut gpu_time = gpu_timing::TokenGpuTime::default();
 
@@ -241,6 +346,44 @@ impl MetalBackend {
             }
             g
         };
+
+        // W1-GPU step 7 (blit-encoder fusion). When `state_dump` is active,
+        // pre-allocate per-layer staging buffers so the layer loop can
+        // **blit** k_out / v_out / h_buf into them instead of forcing a
+        // per-layer commit+wait+CPU-read. Reads run once after the final
+        // commit. Saves ~1.7 ms / token (50 µs × num_layers) on M3 Max.
+        let staging_bufs: Option<(Vec<metal::Buffer>, Vec<metal::Buffer>, Vec<metal::Buffer>)> =
+            if state_dump.is_some() && (dump_kv || dump_h) {
+                let mut sk = Vec::with_capacity(if dump_kv { num_layers } else { 0 });
+                let mut sv = Vec::with_capacity(if dump_kv { num_layers } else { 0 });
+                let mut sh = Vec::with_capacity(if dump_h { num_layers } else { 0 });
+                let hidden_bytes = (hidden * 4) as u64;
+                for layer in layers.iter() {
+                    if dump_kv {
+                        let kv_dim_bytes = (layer.num_kv_heads * layer.head_dim * 4) as u64;
+                        sk.push(self.bufs.output(kv_dim_bytes));
+                        sv.push(self.bufs.output(kv_dim_bytes));
+                    }
+                    if dump_h {
+                        sh.push(self.bufs.output(hidden_bytes));
+                    }
+                }
+                Some((sk, sv, sh))
+            } else {
+                None
+            };
+        // Track for recycling after final commit. Separate from the main
+        // `_scratch_guard` since these buffers are allocated post-setup.
+        let _staging_guard = {
+            let mut g = super::buffers::ScratchGuard::new(&self.bufs);
+            if let Some((sk, sv, sh)) = staging_bufs.as_ref() {
+                for b in sk.iter().chain(sv.iter()).chain(sh.iter()) {
+                    g.track(b);
+                }
+            }
+            g
+        };
+
         let mut h_buf = &h_init;
         // Per-Layer Embeddings precomputed table (Gemma 4 E2B): snapshot
         // once per token so the per-layer loop can read it without
@@ -275,6 +418,34 @@ impl MetalBackend {
             } else {
                 None
             };
+
+            // W1-GPU step 7 (blit fusion): capture h_in for state dump.
+            // - L=0: `x` is on the CPU, push it directly into state_dump.
+            // - L>=1: blit `h_buf` (previous layer's output) into the
+            //   per-layer h-staging buffer. The blit is encoded into the
+            //   same command buffer as the layer compute, so Metal's
+            //   command-buffer ordering guarantees it sees the settled
+            //   value once committed. Drained into state_dump after the
+            //   single final commit at the bottom of the function.
+            if dump_h {
+                if let Some(s) = state_dump.as_deref_mut() {
+                    if l == 0 {
+                        s.h_in_per_layer.push(x.to_vec());
+                    }
+                }
+                if let Some((_, _, ref sh)) = staging_bufs {
+                    if l > 0 && !sh.is_empty() {
+                        if !encoder_ended {
+                            enc.end_encoding();
+                        }
+                        let blit = cmd.new_blit_command_encoder();
+                        blit.copy_from_buffer(h_buf, 0, &sh[l], 0, (hidden * 4) as u64);
+                        blit.end_encoding();
+                        enc = cmd.new_compute_command_encoder().to_owned();
+                        encoder_ended = false;
+                    }
+                }
+            }
             let dump_l0_dir = if l == 0 {
                 larql_compute::options::env_value(larql_compute::options::ENV_DUMP_L0)
             } else {
@@ -529,6 +700,31 @@ impl MetalBackend {
             h_buf = new_h;
             let _ = &scaled_scratch; // keep binding alive; no longer needed
 
+            // W1-GPU step 7 (blit fusion): capture k_new / v_new for state
+            // dump. Instead of committing + waiting to safely read the
+            // scratch k_out / v_out buffers before the next layer
+            // overwrites them, we blit them into per-layer staging
+            // buffers inside the same command buffer. The compute writes
+            // to k_out / v_out happen-before the blit reads (Metal
+            // command-buffer encode order), so the blit captures the
+            // correct values. Drained into state_dump after the single
+            // final commit at the bottom of the function.
+            if dump_kv {
+                if let Some((ref sk, ref sv, _)) = staging_bufs {
+                    if !encoder_ended {
+                        enc.end_encoding();
+                    }
+                    let blit = cmd.new_blit_command_encoder();
+                    let layer_kv_dim_local = layer.num_kv_heads * layer.head_dim;
+                    let bytes = (layer_kv_dim_local * 4) as u64;
+                    blit.copy_from_buffer(&k_out, 0, &sk[l], 0, bytes);
+                    blit.copy_from_buffer(&v_out, 0, &sv[l], 0, bytes);
+                    blit.end_encoding();
+                    enc = cmd.new_compute_command_encoder().to_owned();
+                    encoder_ended = false;
+                }
+            }
+
             // Per-layer NaN diagnostic (LARQL_DEBUG_NAN_LAYERS=1).
             // Forces a commit+wait per layer — expensive, debug-only.
             if larql_compute::options::env_flag(larql_compute::options::ENV_DEBUG_NAN_LAYERS) {
@@ -714,6 +910,32 @@ impl MetalBackend {
             cmd.commit();
             cmd.wait_until_completed();
             gpu_time.record(&cmd);
+        }
+
+        // W1-GPU step 7 (blit fusion): drain per-layer staging buffers
+        // into state_dump now that the single final commit has settled
+        // all blits. `h_in_per_layer[0]` was already pushed inline (CPU
+        // copy of `x`); indices 1..num_layers come from the h-staging
+        // buffers populated by the blits at the top of each layer
+        // body.
+        if let Some(s) = state_dump.as_deref_mut() {
+            if let Some((sk, sv, sh)) = staging_bufs.as_ref() {
+                if dump_h {
+                    for (l, _) in layers.iter().enumerate().skip(1) {
+                        s.h_in_per_layer
+                            .push(super::buffers::read_buffer_f32(&sh[l], hidden));
+                    }
+                }
+                if dump_kv {
+                    for (l, layer) in layers.iter().enumerate() {
+                        let kv_dim_local = layer.num_kv_heads * layer.head_dim;
+                        s.k_new_per_layer
+                            .push(super::buffers::read_buffer_f32(&sk[l], kv_dim_local));
+                        s.v_new_per_layer
+                            .push(super::buffers::read_buffer_f32(&sv[l], kv_dim_local));
+                    }
+                }
+            }
         }
 
         // Diagnostic: dump per-call h after each layer, gated on

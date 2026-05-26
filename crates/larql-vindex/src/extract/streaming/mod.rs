@@ -60,9 +60,20 @@ pub fn build_vindex_streaming(
         ));
     }
 
-    // Detect architecture.
-    let arch = larql_models::detect_architecture_validated(model_dir)
-        .map_err(|e| VindexError::Parse(e.to_string()))?;
+    // Detect architecture. For safetensors input this reads `config.json`
+    // from `model_dir`; for GGUF input the architecture lives in the
+    // file metadata, so we open the entry GGUF, build a config.json
+    // equivalent, and detect from that.
+    let arch = if let Some(gguf_path) = context::detect_gguf_entry(model_dir)? {
+        let gguf = larql_models::loading::gguf::GgufFile::open(&gguf_path)
+            .map_err(|e| VindexError::Parse(format!("open GGUF for arch detection: {e}")))?;
+        let cfg_json = gguf.to_config_json();
+        larql_models::detect_from_json_validated(&cfg_json)
+            .map_err(|e| VindexError::Parse(e.to_string()))?
+    } else {
+        larql_models::detect_architecture_validated(model_dir)
+            .map_err(|e| VindexError::Parse(e.to_string()))?
+    };
     // Reject unsupported attention layouts (e.g. MLA on standard Q/K/V/O
     // manifests) before any output directory or checkpoint is created.
     crate::format::weights::ensure_extract_level_supported(&*arch, extract_level)?;

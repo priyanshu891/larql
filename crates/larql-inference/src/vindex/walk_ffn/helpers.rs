@@ -7,12 +7,19 @@ use crate::vindex::walk_config::WalkFfnConfig;
 /// per-feature loop. Treats `usize::MAX` (set by `::dense` / `--k full`)
 /// as full-K; also caches the check when top-K happens to exceed the
 /// layer's feature count.
+///
+/// When `config.force_walk` is set, returns false unconditionally so
+/// the per-position walk runs even at full-K. Used to measure the walk
+/// paradigm at faithful K without the dispatch failing over to gemv.
 #[inline]
 pub(super) fn hits_len_ge_intermediate(
     config: &WalkFfnConfig,
     layer: usize,
     intermediate: usize,
 ) -> bool {
+    if config.force_walk {
+        return false;
+    }
     match config.k_for(layer) {
         Some(k) => k >= (intermediate * 8) / 10,
         None => true,
@@ -71,6 +78,15 @@ mod tests {
         // k=200 > intermediate=100 → full-K equivalent.
         let cfg = sparse_config(1, 200);
         assert!(hits_len_ge_intermediate(&cfg, 0, 100));
+    }
+
+    #[test]
+    fn hits_len_force_walk_short_circuits_full_k() {
+        // force_walk: even full-K must take the per-position path.
+        let cfg = sparse_config(1, 200).with_force_walk(true);
+        assert!(!hits_len_ge_intermediate(&cfg, 0, 100));
+        let cfg = dense_config(1).with_force_walk(true);
+        assert!(!hits_len_ge_intermediate(&cfg, 0, 100));
     }
 
     #[test]

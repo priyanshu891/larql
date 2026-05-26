@@ -33,6 +33,7 @@ use rayon::prelude::*;
 
 use super::helpers::hits_len_ge_intermediate;
 use super::WalkFfn;
+use crate::vindex::walk_config::FeatureSelector;
 
 impl<'a> WalkFfn<'a> {
     /// Sparse walk FFN — see module docs.
@@ -86,8 +87,14 @@ impl<'a> WalkFfn<'a> {
         };
 
         // ── Full-K gemv fast path ────────────────────────────────────────
-        // See module docs for the three variants (A/B/C).
-        let k_is_full = hits_len_ge_intermediate(&self.config, layer, intermediate);
+        // See module docs for the three variants (A/B/C). Skipped when a
+        // non-default selector is configured or a per-layer pool
+        // restriction is set: in both cases gemv would bypass the
+        // alternative selection criterion, so we force the walk.
+        let selector_forces_walk = !matches!(self.config.selector, FeatureSelector::GateOnly)
+            || self.config.pool_per_layer.is_some();
+        let k_is_full =
+            !selector_forces_walk && hits_len_ge_intermediate(&self.config, layer, intermediate);
         if !layer_has_overrides && is_gated && k_is_full {
             let x_slice_for_matmul: Option<&[f32]> = x.as_slice();
             if let (Some(gate_scores), Some(x_flat)) = (
@@ -146,14 +153,29 @@ impl<'a> WalkFfn<'a> {
             };
 
             let top_k = self.top_k_for(layer);
-            let hits = self
-                .index
-                .gate_walk(layer, &x_owned, top_k)
-                .or_else(|| {
-                    self.backend
-                        .and_then(|be| self.index.gate_knn_q4(layer, &x_owned, top_k, be))
-                })
-                .unwrap_or_else(|| self.index.gate_knn(layer, &x_owned, top_k));
+            let t_gate = std::time::Instant::now();
+            let hits = if let Some(pool_per_layer) = self.config.pool_per_layer.as_ref() {
+                let empty = Vec::new();
+                let pool = pool_per_layer.get(layer).unwrap_or(&empty);
+                self.pool_restricted_gate_knn(layer, &x_owned, top_k, pool)
+            } else {
+                match self.config.selector {
+                    FeatureSelector::GateOnly => self
+                        .index
+                        .gate_walk(layer, &x_owned, top_k)
+                        .or_else(|| {
+                            self.backend
+                                .and_then(|be| self.index.gate_knn_q4(layer, &x_owned, top_k, be))
+                        })
+                        .unwrap_or_else(|| self.index.gate_knn(layer, &x_owned, top_k)),
+                    kind @ (FeatureSelector::GateXDownNorm
+                    | FeatureSelector::GateXUpDownNorm
+                    | FeatureSelector::GateXUpScore
+                    | FeatureSelector::ActXUpScoreXDownNorm
+                    | FeatureSelector::Random) => self.joint_gate_knn(layer, &x_owned, top_k, kind),
+                }
+            };
+            let gate_knn_ns = t_gate.elapsed().as_nanos() as u64;
 
             let mut out_row = out.row_mut(s);
 
@@ -161,11 +183,13 @@ impl<'a> WalkFfn<'a> {
             // count is medium-large (≥ 512) and no native down exists.
             let parallelisable =
                 !layer_has_overrides && is_gated && hits.len() >= 512 && down_native.is_none();
+            let t_cache = std::time::Instant::now();
             let down_cache_local: Option<std::sync::Arc<Vec<f32>>> = if parallelisable {
                 self.index.kquant_ffn_layer(layer, 2)
             } else {
                 None
             };
+            let cache_fetch_ns = t_cache.elapsed().as_nanos() as u64;
             if let Some(down_arc) = down_cache_local.as_ref().filter(|_| parallelisable) {
                 let down_data: &[f32] = down_arc.as_slice();
                 let up_slices = self.index.interleaved_kquant_layer_data(layer);
@@ -183,6 +207,7 @@ impl<'a> WalkFfn<'a> {
                 let chunk_size = hits.len().div_ceil(n_threads);
                 let up_native_ref = up_native.as_ref();
 
+                let t_scan = std::time::Instant::now();
                 let partials: Vec<Vec<f32>> = hits
                     .par_chunks(chunk_size)
                     .map(|chunk| {
@@ -218,13 +243,26 @@ impl<'a> WalkFfn<'a> {
                         partial
                     })
                     .collect();
+                let parallel_scan_ns = t_scan.elapsed().as_nanos() as u64;
 
+                let t_reduce = std::time::Instant::now();
                 let out_slice = out_row.as_slice_mut().unwrap();
                 for p in &partials {
                     for i in 0..hidden {
                         out_slice[i] += p[i];
                     }
                 }
+                let reduce_ns = t_reduce.elapsed().as_nanos() as u64;
+
+                if let Some(h) = &self.phase_timings {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    h.gate_knn_ns.fetch_add(gate_knn_ns, Relaxed);
+                    h.cache_fetch_ns.fetch_add(cache_fetch_ns, Relaxed);
+                    h.parallel_scan_ns.fetch_add(parallel_scan_ns, Relaxed);
+                    h.reduce_ns.fetch_add(reduce_ns, Relaxed);
+                    h.calls.fetch_add(1, Relaxed);
+                }
+
                 self.trace_path(layer, "sparse:parallel_q4k_down");
                 continue;
             }

@@ -55,3 +55,47 @@ pub mod no_cache;
 pub mod standard;
 pub mod turbo_quant;
 pub mod unlimited_context;
+
+/// Whether W10 mask cascade is active.
+///
+/// Default: **on** (since 2026-05-21). The mask is bit-identical to
+/// Full under each opted-in engine's exact_logits contract (proven by
+/// `examples/w10_parity_gate.rs`) and closes the ~13% gap to
+/// `standard`'s fused-kernel ceiling on Metal.
+///
+/// Opt out with `LARQL_W10_DISABLE=1` (debug instrument for
+/// bisecting masked-backend regressions). `LARQL_W10_HONLY=1` is
+/// also accepted for backwards compat with older bench scripts —
+/// it's now a no-op since the cascade is on by default.
+///
+/// Used by the per-engine `dispatch.rs` modules
+/// (markov_residual, markov_residual_codec, unlimited_context,
+/// boundary_per_layer). Engines that treat K/V as canonical state
+/// (turbo_quant) don't call this — their dispatch path stays on
+/// Full mask regardless.
+///
+/// Tests inject a value through `set_w10_disabled_override` (per-thread)
+/// rather than mutating the process env, so they don't race other
+/// parallel tests that also call this helper.
+pub(crate) fn w10_enabled() -> bool {
+    let overridden = W10_DISABLED_OVERRIDE.with(|o| *o.borrow());
+    match overridden {
+        Some(disabled) => !disabled,
+        None => std::env::var("LARQL_W10_DISABLE").as_deref() != Ok("1"),
+    }
+}
+
+std::thread_local! {
+    /// Per-thread override for [`w10_enabled`]. `Some(true)` simulates
+    /// `LARQL_W10_DISABLE=1` (cascade off); `Some(false)` simulates the
+    /// var unset (cascade on); `None` falls through to the real env.
+    /// Test-only escape hatch — production callers leave it `None`.
+    static W10_DISABLED_OVERRIDE: std::cell::RefCell<Option<bool>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn set_w10_disabled_override(disabled: Option<bool>) {
+    W10_DISABLED_OVERRIDE.with(|o| *o.borrow_mut() = disabled);
+}

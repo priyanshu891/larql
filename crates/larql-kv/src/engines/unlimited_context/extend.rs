@@ -117,13 +117,14 @@ pub fn rs_extend_from_checkpoint_backend(
 /// `BackendFfn` (needs f32 tensors in `weights.tensors`). Attention projection
 /// uses the dequantised f32 tensors already inserted by
 /// `ensure_attn_tensors_dequantised`. Call that before this function.
-pub fn rs_extend_from_checkpoint_q4k(
+pub fn rs_extend_from_checkpoint_quant(
     weights: &ModelWeights,
     index: &VectorIndex,
     token_ids: &[u32],
     prior_kv: Vec<SharedKV>,
     abs_start: usize,
     backend: &dyn ComputeBackend,
+    mut profiler: Option<&mut crate::profiler::EngineProfiler>,
 ) -> Option<ExtendOutput> {
     let num_layers = weights.num_layers;
 
@@ -143,10 +144,16 @@ pub fn rs_extend_from_checkpoint_q4k(
     let walk_ffn = WalkFfn::from_config(weights, index, WalkFfnConfig::dense(num_layers))
         .with_backend(backend);
 
-    // Per-stage timing. Enabled by `LARQL_INSTRUMENT_UNLIMITED=1`.
-    // Walks the same layers MarkovResidual's q4k path instruments — kept
-    // shape-compatible so output comparisons line up.
+    // Per-stage timing. `LARQL_INSTRUMENT_UNLIMITED=1` enables the
+    // verbose stderr line; `profiler` is the structured channel used by
+    // `larql bench --profile`. Both gate on the same flag bit.
     let instrument = std::env::var("LARQL_INSTRUMENT_UNLIMITED").is_ok();
+    let timing = profiler.is_some() || instrument;
+    let t_step = if timing {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     let mut t_embed = 0.0f64;
     let mut t_attention = 0.0f64;
     let mut t_ffn = 0.0f64;
@@ -155,14 +162,14 @@ pub fn rs_extend_from_checkpoint_q4k(
 
     for (i, &token_id) in token_ids.iter().enumerate() {
         let abs_position = abs_start + i;
-        let t_embed_start = if instrument {
+        let t_embed_start = if timing {
             Some(std::time::Instant::now())
         } else {
             None
         };
         let mut h = embed_tokens_pub(weights, &[token_id]);
         if let Some(start) = t_embed_start {
-            t_embed += start.elapsed().as_secs_f64() * 1000.0;
+            t_embed += start.elapsed().as_secs_f64() * 1e6;
         }
 
         for (layer, kv_slot) in kv_cache.iter_mut().enumerate() {
@@ -174,7 +181,7 @@ pub fn rs_extend_from_checkpoint_q4k(
 
             // Try production native-quantised attention helper first;
             // fall back to f32 path. Same pattern as MarkovResidual.
-            let t_attn_start = if instrument {
+            let t_attn_start = if timing {
                 Some(std::time::Instant::now())
             } else {
                 None
@@ -202,14 +209,14 @@ pub fn rs_extend_from_checkpoint_q4k(
                 )
             })?;
             if let Some(start) = t_attn_start {
-                t_attention += start.elapsed().as_secs_f64() * 1000.0;
+                t_attention += start.elapsed().as_secs_f64() * 1e6;
             }
 
             // Native-quantised FFN; falls back to WalkFfn (which falls
             // further to dense f32 if no sparse features). The native
             // path is ~100× faster on Gemma 3 4B Q4K — see
             // `bench/baselines/cpu/async-dispatch-2026-05-16.md`.
-            let t_ffn_start = if instrument {
+            let t_ffn_start = if timing {
                 Some(std::time::Instant::now())
             } else {
                 None
@@ -229,7 +236,7 @@ pub fn rs_extend_from_checkpoint_q4k(
                 h
             });
             if let Some(start) = t_ffn_start {
-                t_ffn += start.elapsed().as_secs_f64() * 1000.0;
+                t_ffn += start.elapsed().as_secs_f64() * 1e6;
             }
             h = h_out;
             *kv_slot = new_kv;
@@ -241,11 +248,30 @@ pub fn rs_extend_from_checkpoint_q4k(
     if instrument {
         let total = t_embed + t_attention + t_ffn;
         eprintln!(
-            "[unlimited-context/extend_q4k] tokens={} layers={num_layers} \
-             embed={t_embed:.2}ms attention={t_attention:.2}ms ffn={t_ffn:.2}ms \
-             total={total:.2}ms (attn_helper miss/ffn_helper miss={t_attn_helper_misses}/{t_ffn_helper_misses})",
-            token_ids.len()
+            "[unlimited-context/extend_quant] tokens={} layers={num_layers} \
+             embed={:.2}ms attention={:.2}ms ffn={:.2}ms total={:.2}ms \
+             (attn_helper miss/ffn_helper miss={t_attn_helper_misses}/{t_ffn_helper_misses})",
+            token_ids.len(),
+            t_embed / 1e3,
+            t_attention / 1e3,
+            t_ffn / 1e3,
+            total / 1e3,
         );
+    }
+
+    if let (Some(prof), Some(t_step)) = (profiler.as_mut(), t_step) {
+        // unlimited_context appends K/V incrementally → no `recompute_*`
+        // stages fire. embed/attention/ffn/decode_total carry the
+        // attribution; recompute_cold/hot stay at zero (and the print
+        // logic shows them only when non-zero).
+        prof.embed.total_us += t_embed;
+        prof.embed.count += 1;
+        prof.attention.total_us += t_attention;
+        prof.attention.count += 1;
+        prof.ffn.total_us += t_ffn;
+        prof.ffn.count += 1;
+        prof.decode_total.total_us += t_step.elapsed().as_secs_f64() * 1e6;
+        prof.decode_total.count += 1;
     }
 
     let new_checkpoint: Vec<SharedKV> = kv_cache
@@ -405,37 +431,51 @@ mod tests {
         assert!(second.last_hidden.iter().all(|v| v.is_finite()));
     }
 
-    // ── rs_extend_from_checkpoint_q4k (vindex-backed FFN path) ───────────────
+    // ── rs_extend_from_checkpoint_quant (vindex-backed FFN path) ───────────────
 
     #[test]
-    fn extend_q4k_empty_tokens_returns_none() {
+    fn extend_quant_empty_tokens_returns_none() {
         let weights = make_test_weights();
         let index = larql_inference::test_utils::make_test_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let prior = empty_prior(&weights);
-        let out = rs_extend_from_checkpoint_q4k(&weights, &index, &[], prior, 0, &*backend);
+        let out = rs_extend_from_checkpoint_quant(&weights, &index, &[], prior, 0, &*backend, None);
         assert!(out.is_none(), "empty token_ids should return None");
     }
 
     #[test]
-    fn extend_q4k_wrong_prior_len_returns_none() {
+    fn extend_quant_wrong_prior_len_returns_none() {
         let weights = make_test_weights();
         let index = larql_inference::test_utils::make_test_vindex(&weights);
         let backend = larql_compute::cpu_backend();
-        let out =
-            rs_extend_from_checkpoint_q4k(&weights, &index, &[0u32], Vec::new(), 0, &*backend);
+        let out = rs_extend_from_checkpoint_quant(
+            &weights,
+            &index,
+            &[0u32],
+            Vec::new(),
+            0,
+            &*backend,
+            None,
+        );
         assert!(out.is_none(), "prior length mismatch should return None");
     }
 
     #[test]
-    fn extend_q4k_grows_kv_cache_and_returns_finite() {
+    fn extend_quant_grows_kv_cache_and_returns_finite() {
         let weights = make_test_weights();
         let index = larql_inference::test_utils::make_test_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let prior = empty_prior(&weights);
-        let out =
-            rs_extend_from_checkpoint_q4k(&weights, &index, &[0u32, 1, 2], prior, 0, &*backend)
-                .expect("3-token Q4K extend");
+        let out = rs_extend_from_checkpoint_quant(
+            &weights,
+            &index,
+            &[0u32, 1, 2],
+            prior,
+            0,
+            &*backend,
+            None,
+        )
+        .expect("3-token Q4K extend");
         assert_eq!(out.last_hidden.shape(), &[1, weights.hidden_size]);
         assert!(out.last_hidden.iter().all(|v| v.is_finite()));
         // After 3 tokens from an empty prior, each layer's K/V has 3 rows.
@@ -448,26 +488,28 @@ mod tests {
     }
 
     #[test]
-    fn extend_q4k_seeded_from_prior_matches_shape() {
+    fn extend_quant_seeded_from_prior_matches_shape() {
         let weights = make_test_weights();
         let index = larql_inference::test_utils::make_test_vindex(&weights);
         let backend = larql_compute::cpu_backend();
-        let first = rs_extend_from_checkpoint_q4k(
+        let first = rs_extend_from_checkpoint_quant(
             &weights,
             &index,
             &[0u32, 1],
             empty_prior(&weights),
             0,
             &*backend,
+            None,
         )
         .expect("first extend");
-        let second = rs_extend_from_checkpoint_q4k(
+        let second = rs_extend_from_checkpoint_quant(
             &weights,
             &index,
             &[2u32],
             first.kv_cache.clone(),
             2,
             &*backend,
+            None,
         )
         .expect("extend over prior kv");
         assert_eq!(second.last_hidden.shape(), &[1, weights.hidden_size]);

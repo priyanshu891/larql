@@ -1,6 +1,38 @@
 # Roadmap — larql-models
 
-## Current: 12 architectures, 337 tests (227 src + 82 + 28 integration), safetensors + GGUF loading, config-driven `rope_scaling` / `norm_eps` / GPT-2 legacy aliases
+## Current: 12 architectures, 309 tests, safetensors + GGUF loading, config-driven `rope_scaling` / `norm_eps` / GPT-2 legacy aliases, multi-modal trait surface + vision tower + projector weights/loaders
+
+### Multi-modal Phase 1 (landed 2026-05-24, PR #143)
+
+- **multimodal.rs**: `ModalEncoder`, `Connector`, `MultiModalProtocol`,
+  `PlaceholderProtocol`, `TokenBudget` (Fixed / PerTile / Dynamic),
+  `PrecomputedScaling`, `Modality`, `ModalInput`. `ModelArchitecture`
+  gains `multimodal()` default None; Gemma3Arch overrides with verified
+  token IDs.
+- **encoders/vision_tower.rs**: `VisionConfig` (generic, parsed from
+  `vision_config` in config.json), `VisionWeights`, `VisionLayerWeights`,
+  `ProjWithBias`, `LayerNormWeights`, `load_vision_tower_from_safetensors`.
+  Arch-agnostic: same struct works for SigLIP, SigLIP2, ViT.
+- **connectors/projector.rs**: `ProjectorWeights`,
+  `load_projector_from_safetensors`. Loads `multi_modal_projector.*`
+  tensors (projection matrix + optional norm weight).
+- Design doc: `docs/multi-modal.md`. ADR: `docs/adr/0023-multimodal-engine-seam.md`.
+
+### Multi-modal Phase 2 (landed 2026-05-25, PR #144)
+
+- **architectures/granite.rs**: `GraniteVisionMultiModal` protocol —
+  SigLIP2 encoder, `PerTile{729}` budget, AnyRes tile counts `[1..6]`,
+  `precomputed_scaling = None`. Gated by `has_vision_config` on
+  `ModelConfig` (set by parser from `config.json` `vision_config` presence).
+- **encoders/vision_tower.rs**: `VisionConfig` extended with `hidden_act`
+  (default `gelu_pytorch_tanh`) and `norm_type` (default `layer_norm`)
+  for SigLIP2 parametrization. `is_siglip2()` helper.
+- **connectors/mlp_connector.rs**: `MlpConnectorWeights` (fc1/fc2 weight
+  + bias), `load_mlp_connector_from_safetensors`. 2-layer MLP GELU
+  connector for Granite Vision.
+- **config.rs**: `has_vision_config: bool` field on `ModelConfig`.
+- **detect/parser.rs**: sets `has_vision_config` from
+  `config.get("vision_config").is_some()`.
 
 ## Config-loading correctness pass 2026-05-16
 

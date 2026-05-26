@@ -1,8 +1,15 @@
-//! End-to-end demo of all four KV engines on synthetic weights.
+//! End-to-end demo of every shipped engine on synthetic weights.
 //!
 //! Loads the `larql_inference::test_utils` 2-layer fixture, then runs each
 //! engine through prefill + a few decode steps, printing the per-engine
 //! diagnostics so you can see the trait surface in action.
+//!
+//! Covers all 9 `EngineKind` variants (8 K/V engines via `KvEngine`
+//! plus Apollo via `RetrievalEngine`). Apollo prefills with no store
+//! attached, so the demo intentionally surfaces its
+//! `EngineError::RetrievalMiss` — that's the path the typed-error
+//! migration was designed to make visible (the harness previously
+//! collapsed it into a silent `None`).
 //!
 //! Run with:
 //!
@@ -13,17 +20,17 @@
 use larql_inference::cpu_engine_backend;
 use larql_inference::ffn::WeightFfn;
 use larql_inference::test_utils::make_test_weights;
-use larql_kv::{EngineKind, KvEngine};
+use larql_kv::{AnyEngine, EngineKind};
 
-fn run_engine(label: &str, mut engine: Box<dyn KvEngine>) {
+fn run_engine(label: &str, mut engine: AnyEngine) {
     let weights = make_test_weights();
     let ffn = WeightFfn { weights: &weights };
     let prompt: Vec<u32> = (0..8).collect();
 
     print!("{label:<32} ");
     let prefill = engine.prefill(&weights, &ffn, &prompt);
-    if prefill.is_none() {
-        println!("prefill returned None (engine not configured)");
+    if let Err(err) = prefill {
+        println!("prefill failed (engine not configured): {err}");
         return;
     }
 
@@ -43,6 +50,9 @@ fn run_engine(label: &str, mut engine: Box<dyn KvEngine>) {
 
 fn main() {
     let specs = [
+        "standard",
+        "standard:window=8",
+        "no-cache",
         "markov-rs",
         "markov-rs:window=4",
         "unlimited-context:window=4",
@@ -53,6 +63,8 @@ fn main() {
         "boundary-kv:window=4,chunk_tokens=4,sequence_id=demo-bounded",
         "markov-rs-codec",
         "markov-rs-codec:window=4",
+        "boundary-per-layer:layers=2",
+        "boundary-per-layer:window=4,layers=2",
     ];
 
     println!("larql-kv engine ladder (synthetic 2-layer model)\n");

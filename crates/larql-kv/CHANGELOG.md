@@ -6,6 +6,80 @@ The format follows [Keep a Changelog](https://keepachangelog.com/) conventions
 with dated entries (`YYYY-MM-DD`) instead of semantic versions during the
 pre-1.0 phase. Forward-looking work lives in [`ROADMAP.md`](ROADMAP.md).
 
+## [2026-05-20] — boundary_per_layer: bugfixes + W1-GPU dispatch + modular split
+
+**Engine bottleneck audit** (`PERFORMANCE.md` §"2026-05-20"). Findings
+across all engines:
+
+- `apollo` — O(N²) **by design** (`forward_from_layer` rebuilds KV each
+  step over the growing context; no cross-step persistence). Not a
+  bug; documented as a contract caveat for short-query workloads.
+- `boundary_per_layer` — two real O(N²) bugs, both fixed:
+  - **Bug A** (hot-tier rebuild): every `decode_step` rebuilt every
+    layer's `stored[layer]` via `Array2::zeros((s_old+1, h)) + assign`.
+    O(N · num_layers · hidden) per step → O(N²) total in unbounded
+    mode. Replaced with `ndarray::Array2::push_row` (amortised O(m)).
+  - **Bug B** (cold_kv nuke): every overflow set `cold_kv = None`,
+    forcing the next decode to recompute K/V over the entire cold
+    tier — O(N²) windowed mode. Replaced with
+    `cold_tier::extend_cold_kv_with_overflow` which appends K/V at
+    each overflow at the pre-`cold_encoded.append` absolute position.
+
+**W1-GPU dispatch wired** for `boundary_per_layer`. New
+`try_prefill_via_dispatch` + `decode_step_via_dispatch` route through
+the Metal-fused per-layer state-dump kernel when the backend/vindex
+support it. Closes the perf gap to its sister engine
+`markov_residual_codec`: **91.8 tok/s** vs codec's 92.6 (−0.9%) on
+Gemma 3 4B Q4K, M3 Max — with **44% less hot memory** (19.6 MB vs
+35.3 MB). Falls back to dense walk on backends/vindexes lacking
+direct-matvec.
+
+**FFN routing fix** — `boundary_per_layer`'s dense `run_prefill` /
+`run_decode` previously constructed `BackendFfn` internally, ignoring
+the caller-supplied `ffn`. This panicked on `--compact` vindexes
+where dense FFN weights aren't present. Now routes the caller's FFN
+through (e.g. `WalkFfn` from the bench CLI).
+
+**`EngineKind` variant + parser**. `BoundaryPerLayer { window_size,
+num_layers }` with three aliases (`boundary-per-layer`,
+`boundary_per_layer`, `boundary-pl`); default `num_layers=34` (Gemma
+3 4B), override via `layers=N`. Build dispatch seeds a uniform-bf16
+`InMemoryCalibrationStore` automatically. Added to
+`examples/engine_ladder.rs`.
+
+**Parity gate** — `examples/boundary_per_layer_parity_gate.rs` runs
+`boundary-per-layer` vs `markov-rs-codec` end-to-end on a real Gemma
+3 4B Q4K vindex. Token-level agreement check (not bit-identity,
+because incremental cold_kv vs recompute-each-step differ in BLAS
+accumulation order). Pass criterion: first divergence ≥ step 5.
+Result on Gemma 3 4B: **100% token agreement** across 50 tokens in
+both unbounded and windowed (window=512) — RoPE positioning in
+`extend_cold_kv_with_overflow` and codec round-trip are exactly
+right.
+
+**Modular split** of `boundary_per_layer/engine.rs` (1250 → 716 LOC),
+mirroring `markov_residual_codec`'s module layout. New sibling files
+in `engines/boundary_per_layer/`:
+
+- `walk.rs` (204 LOC) — CPU dense walk path
+  (`run_prefill` / `run_decode` as free functions).
+- `dispatch.rs` (162 LOC) — W1-GPU dispatch path.
+- `executor.rs` (186 LOC) — `LayerExecutor`-driven path.
+- `cold_tier.rs` (130 LOC) — `extend_cold_kv_with_overflow` +
+  `roundtrip` / `last_row` helpers + their unit tests.
+
+Struct fields moved to `pub(super)` so sibling modules can read them
+via free-function inputs.
+
+**Test count**: 591 → 598 lib tests (3 parser variants + 1 cold_kv
+invariant + 3 from cold_tier extraction). All passing.
+
+The same split pattern is queued for the other 6 engines
+(`markov_residual_codec`, `turbo_quant`, `unlimited_context`,
+`apollo`, `boundary_kv`, and `markov_residual` last) — deferred to
+follow-up turns since each requires its own care and at least one is
+gated on in-flight WIP in `markov_residual/compute.rs`.
+
 ## [2026-05-16] — KV engine unification (steps 1-5 of 7)
 
 Unifies the parallel "live decode cache" and "research KV engine" code

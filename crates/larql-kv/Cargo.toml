@@ -34,14 +34,18 @@ openblas-src = { version = "0.10", features = ["system"] }
 ndarray = { version = "0.16", features = ["blas"] }
 blas-src = { version = "0.10", features = ["accelerate"] }
 
+# Windows: no BLAS backend. See `larql-compute/Cargo.toml` for the
+# rationale — the system OpenBLAS race manifests primarily here,
+# where most of the "compare two compute paths against self" tests
+# live (vindex_compare, markov_residual). `blas-src` kept featureless
+# so existing `extern crate blas_src;` declarations still compile.
 [target.'cfg(target_os = "windows")'.dependencies]
-ndarray = { version = "0.16", features = ["blas"] }
-blas-src = { version = "0.10", features = ["openblas"], default-features = false }
-openblas-src = { version = "0.10", features = ["system"] }
+ndarray = "0.16"
+blas-src = { version = "0.10", default-features = false }
 
 [features]
 default = []
-metal = ["dep:larql-compute-metal", "larql-inference/metal"]
+gpu = ["dep:larql-compute-metal", "larql-inference/gpu"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

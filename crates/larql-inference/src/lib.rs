@@ -56,6 +56,7 @@ pub mod chat;
 pub mod error;
 pub mod experts;
 pub mod ffn;
+pub mod ffn_policy;
 pub mod forward;
 pub mod forward_overrides;
 pub mod kv_dispatch;
@@ -96,10 +97,10 @@ pub fn cpu_engine_backend() -> Box<dyn EngineBackend> {
 }
 
 /// Default backend as `Box<dyn EngineBackend>` — Metal on macOS when
-/// the `metal` feature is enabled, CPU otherwise. Parallel to
+/// the `gpu` feature is enabled, CPU otherwise. Parallel to
 /// `default_backend()` but returns the wider trait object.
 pub fn default_engine_backend() -> Box<dyn EngineBackend> {
-    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[cfg(all(feature = "gpu", target_os = "macos"))]
     {
         if let Some(metal) = larql_compute_metal::MetalBackend::new() {
             return Box::new(metal);
@@ -118,7 +119,7 @@ pub fn cpu_async_engine_backend() -> Box<dyn AsyncComputeBackend> {
 }
 
 /// Default async backend as `Box<dyn AsyncComputeBackend>` — Metal on
-/// macOS when the `metal` feature is enabled, CPU otherwise. Parallel
+/// macOS when the `gpu` feature is enabled, CPU otherwise. Parallel
 /// to [`default_engine_backend`].
 ///
 /// At A3 (scaffolding), the Metal variant delegates every async call
@@ -126,7 +127,7 @@ pub fn cpu_async_engine_backend() -> Box<dyn AsyncComputeBackend> {
 /// tok/s shape changes at A4 when `MetalBackend` lands real deferred
 /// dispatch (one `MTLCommandBuffer` per session).
 pub fn default_async_engine_backend() -> Box<dyn AsyncComputeBackend> {
-    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[cfg(all(feature = "gpu", target_os = "macos"))]
     {
         if let Some(metal) = larql_compute_metal::MetalBackend::new() {
             return Box::new(metal);
@@ -136,18 +137,18 @@ pub fn default_async_engine_backend() -> Box<dyn AsyncComputeBackend> {
 }
 
 /// Default compute backend as `Box<dyn ComputeBackend>` — Metal on
-/// macOS when the `metal` feature is enabled, CPU otherwise.
+/// macOS when the `gpu` feature is enabled, CPU otherwise.
 ///
 /// `larql_compute::default_backend()` lost its Metal auto-detection
 /// after the `larql-compute-metal` extraction (the comment in that
 /// function recommends callers construct `MetalBackend` directly).
 /// This factory restores the convenience for callers that want a
-/// runtime-detected GPU backend without `#[cfg(feature = "metal")]`
+/// runtime-detected GPU backend without `#[cfg(feature = "gpu")]`
 /// gating in every call site — `larql bench --backends metal` uses it,
 /// engines that want a compute backend for `fused_prefill` /
 /// `fused_decode_step` use it.
 pub fn default_compute_backend() -> Box<dyn larql_compute::ComputeBackend> {
-    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[cfg(all(feature = "gpu", target_os = "macos"))]
     {
         if let Some(metal) = larql_compute_metal::MetalBackend::new() {
             return Box::new(metal);
@@ -185,8 +186,8 @@ pub use ffn::{
     ShardConfig, SparseFfn, WeightFfn, WirePreference,
 };
 pub use kv_dispatch::{
-    CompressionCodec, EngineBackend, KvDispatch, KvHandle, KvHandleInner, ResidualHandle,
-    ResidualHandleInner,
+    CompressionCodec, EngineBackend, KvDispatch, KvHandle, KvHandleInner, PerLayerDecodeState,
+    ResidualHandle, ResidualHandleInner,
 };
 pub use kv_engine::{DecodeStageSummary, EngineInfo, KvEngine};
 // Crate-root forward re-exports — kept for any name with external use OR
@@ -335,7 +336,7 @@ mod factory_tests {
     //! Coverage for the engine/backend factory functions at the crate root.
     //!
     //! Each factory exists so engines can construct themselves without the
-    //! caller branching on `#[cfg(feature = "metal")]`. The tests verify
+    //! caller branching on `#[cfg(feature = "gpu")]`. The tests verify
     //! that the returned trait object is the CPU backend on the default
     //! build (no `metal` feature on the test runner CI matrix) and that
     //! each factory's pipeline-back name plumbs through.

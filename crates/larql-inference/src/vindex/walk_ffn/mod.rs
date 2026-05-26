@@ -56,12 +56,35 @@ mod interleaved;
 mod interleaved_kquant_dequant;
 mod interleaved_kquant_native;
 mod interleaved_q4;
+mod selector;
 mod sparse;
 
 #[cfg(test)]
 mod routing_tests;
 
 pub use helpers::DispatchEntry;
+
+/// Phase-timing sink for `sparse:parallel_q4k_down`. All counters are
+/// `AtomicU64` so the rayon-parallel scan can record without locking.
+/// Times are sums across every invocation of the branch (a per-position
+/// call) — divide by `calls` for a per-call average.
+#[derive(Debug, Default)]
+pub struct PhaseTimingsHandle {
+    /// Time inside the per-position gate KNN dispatch (`gate_walk`
+    /// → `gate_knn_q4` → `gate_knn` fallback chain). Counts once per
+    /// (position, layer) — i.e. once per `parallel_q4k_down` call.
+    pub gate_knn_ns: std::sync::atomic::AtomicU64,
+    /// Time inside `kquant_ffn_layer(layer, 2)` — should be ~0 once the
+    /// dequantised down cache is warm.
+    pub cache_fetch_ns: std::sync::atomic::AtomicU64,
+    /// Time spent in the `par_chunks().map().collect()` scan — the
+    /// per-feature up-dot + scaled-add loop. Expected to dominate.
+    pub parallel_scan_ns: std::sync::atomic::AtomicU64,
+    /// Time spent summing per-thread partials into the output row.
+    pub reduce_ns: std::sync::atomic::AtomicU64,
+    /// Number of times the parallel_q4k_down branch fired.
+    pub calls: std::sync::atomic::AtomicU64,
+}
 
 pub struct WalkFfn<'a> {
     pub weights: &'a ModelWeights,
@@ -75,6 +98,16 @@ pub struct WalkFfn<'a> {
     /// path appends a (layer, name) entry on exit. Used by the routing
     /// unit tests and by the env-var dispatch trace for Q2 debugging.
     dispatch_trace: std::cell::RefCell<Option<Vec<DispatchEntry>>>,
+    /// Phase-timing sink for `sparse:parallel_q4k_down`. `None` =
+    /// disabled. When `Some`, the branch records cache_fetch / scan /
+    /// reduce timings via atomic adds.
+    pub(super) phase_timings: Option<std::sync::Arc<PhaseTimingsHandle>>,
+    /// Lazy cache of per-feature `‖down_row‖` per layer. Built on first
+    /// use when the selector is `GateXDownNorm` or `GateXUpDownNorm`.
+    pub(super) down_norms_cache: std::cell::RefCell<Vec<Option<std::sync::Arc<Vec<f32>>>>>,
+    /// Lazy cache of per-feature `‖up_row‖` per layer. Built on first
+    /// use when the selector is `GateXUpDownNorm`.
+    pub(super) up_norms_cache: std::cell::RefCell<Vec<Option<std::sync::Arc<Vec<f32>>>>>,
 }
 
 impl<'a> WalkFfn<'a> {
@@ -83,6 +116,7 @@ impl<'a> WalkFfn<'a> {
         index: &'a dyn GateIndex,
         config: WalkFfnConfig,
     ) -> Self {
+        let num_layers = weights.num_layers;
         Self {
             weights,
             index,
@@ -92,7 +126,17 @@ impl<'a> WalkFfn<'a> {
             record_trace: false,
             l1_cache: None,
             dispatch_trace: std::cell::RefCell::new(None),
+            phase_timings: None,
+            down_norms_cache: std::cell::RefCell::new(vec![None; num_layers]),
+            up_norms_cache: std::cell::RefCell::new(vec![None; num_layers]),
         }
+    }
+
+    /// Attach a phase-timing sink. Records cache_fetch / scan / reduce
+    /// timings inside `sparse:parallel_q4k_down` via atomic adds.
+    pub fn with_phase_timings(mut self, handle: std::sync::Arc<PhaseTimingsHandle>) -> Self {
+        self.phase_timings = Some(handle);
+        self
     }
 
     pub fn with_backend(mut self, backend: &'a dyn ComputeBackend) -> Self {

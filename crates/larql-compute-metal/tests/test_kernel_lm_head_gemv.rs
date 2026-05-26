@@ -44,7 +44,7 @@
 //!
 //! ```bash
 //! LARQL_RUN_LM_HEAD_BISECT=1 \
-//!   cargo test --release --features metal -p larql-compute \
+//!   cargo test --release --features gpu -p larql-compute \
 //!     --test test_kernel_lm_head_gemv -- --nocapture
 //! ```
 
@@ -293,7 +293,7 @@ fn q4_matvec_cutoff_sweep() {
 /// This test runs at small N (1024 rows × 256 hidden, < 200 KB Q4) and
 /// asserts every output row is non-zero. With the pre-fix bug 75 % of
 /// rows would zero-out; post-fix every row is written. Un-gated so
-/// it runs in casual `cargo test --features metal` and CI.
+/// it runs in casual `cargo test --features gpu` and CI.
 #[test]
 fn q4_matvec_metal_writes_every_row_small_n() {
     let metal = get_metal();

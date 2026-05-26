@@ -56,16 +56,16 @@ pub(super) fn run_larql(
             .map_err(|e| format!("tokenize: {e}"))?;
 
     let backend: Box<dyn larql_compute::ComputeBackend> = if metal {
-        #[cfg(all(feature = "metal", target_os = "macos"))]
+        #[cfg(all(feature = "gpu", target_os = "macos"))]
         {
             let b = larql_compute_metal::MetalBackend::new().ok_or(
-                "Metal backend unavailable — rebuild with `--features metal` on an M-series Mac",
+                "Metal backend unavailable — rebuild with `--features gpu` on an M-series Mac",
             )?;
             Box::new(b)
         }
-        #[cfg(not(all(feature = "metal", target_os = "macos")))]
+        #[cfg(not(all(feature = "gpu", target_os = "macos")))]
         {
-            return Err("Metal backend requires the `metal` feature on macOS".into());
+            return Err("Metal backend requires the `gpu` feature on macOS".into());
         }
     } else {
         Box::new(larql_compute::CpuBackend)
@@ -90,9 +90,16 @@ pub(super) fn run_larql(
         );
     }
 
-    if args.profile {
-        std::env::set_var("LARQL_PROFILE_SPLIT", "1");
-    }
+    // NOTE: `--profile` enables engine-side stage timers
+    // (`EngineProfiler`) only — cheap, just per-step `Instant::now()`
+    // records. The kernel-side per-stage GPU-timestamp breakdown
+    // (`LARQL_PROFILE_SPLIT=1`) is intentionally NOT coupled here.
+    // Measured 2026-05-18: setting `LARQL_PROFILE_SPLIT=1`
+    // automatically with `--profile` added ~20 ms CPU per token
+    // (102 GPU-timestamp queries) and turned the dispatch hot path
+    // from 11 ms/step into 30 ms/step — a 2.7× distortion that
+    // masked the actual W10 deltas. Users who specifically want the
+    // GPU-stage breakdown set `LARQL_PROFILE_SPLIT=1` explicitly.
     let max_tokens = args.warmup + args.tokens;
     let num_layers = weights.num_layers;
     let t0 = Instant::now();

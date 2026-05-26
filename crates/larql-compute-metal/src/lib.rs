@@ -52,6 +52,8 @@
 // platform` block so error messages point at the actual file paths.
 
 #[cfg(target_os = "macos")]
+pub mod async_compute_backend_impl;
+#[cfg(target_os = "macos")]
 pub mod backend;
 #[cfg(target_os = "macos")]
 pub mod buffers;
@@ -63,6 +65,8 @@ pub mod decode;
 pub mod diag;
 #[cfg(target_os = "macos")]
 pub mod kernels;
+#[cfg(target_os = "macos")]
+pub mod kv_dispatch_impl;
 #[cfg(target_os = "macos")]
 pub mod ops;
 #[cfg(target_os = "macos")]

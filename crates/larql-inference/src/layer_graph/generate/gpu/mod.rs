@@ -14,6 +14,13 @@ mod sampling_step;
 
 pub use forced_logits::{stream_forced_full_logits, ForcedLogitsResult};
 
+/// PLE upload callback — invoked once per token before the per-token GPU
+/// forward pass on per-layer-embedding models (e.g. Gemma 4 E2B). `None`
+/// elsewhere. See [`crate::forward::ple`] for the per-layer-input
+/// precompute that feeds this. Aliased to keep clippy's
+/// `type_complexity` lint happy at the call sites.
+pub(super) type UploadPleFn<'a> = &'a dyn Fn(u32, &[f32]);
+
 use super::cpu::{backend_supports_fused_q4_pipeline, generate_via_cpu_q4k};
 use super::detok::Detokenizer;
 use super::eos::EosConfig;
@@ -249,78 +256,41 @@ where
     let softcap_val = arch.attn_logit_softcapping().unwrap_or(0.0);
     let qk_norm_val = arch.attn_q_norm_key(0).is_some();
 
-    // PLE setup: downcast the backend to MetalBackend so we can call
-    // `prepare_ple_inputs` between decode steps. None unless the env flag
-    // is set AND backend is Metal. The `metal_ple` machinery is only
-    // meaningful with `--features metal`; without that feature the
-    // backend cannot be a `MetalBackend` and the PLE path is unreachable.
-    #[cfg(all(feature = "metal", target_os = "macos"))]
-    let metal_ple = if metal_ple_enabled {
-        backend
-            .as_any()
-            .downcast_ref::<larql_compute_metal::MetalBackend>()
-    } else {
-        None
-    };
-    #[cfg(not(all(feature = "metal", target_os = "macos")))]
-    let metal_ple: Option<()> = {
-        let _ = metal_ple_enabled;
-        None
-    };
-    // PLE input width is only consumed by the metal-gated `upload_ple`
-    // closure below; on non-metal builds the binding is unused. Split
-    // the cfg so each path gets the right warning posture without
-    // breaking the metal name resolution.
-    #[cfg(all(feature = "metal", target_os = "macos"))]
-    let ple_dim = if metal_ple.is_some() {
-        weights.arch.per_layer_embed_dim()
-    } else {
-        0
-    };
-    #[cfg(not(all(feature = "metal", target_os = "macos")))]
-    let _ple_dim = if metal_ple.is_some() {
+    // PLE setup: probe the backend for `PerLayerEmbeddings` instead of
+    // downcasting to a concrete type. The closure dispatches through
+    // `ComputeBackend::prepare_ple_inputs`; CPU and any non-PLE backend
+    // get the trait's no-op default and the closure stays unused (we
+    // gate construction on `use_ple`).
+    let use_ple =
+        metal_ple_enabled && backend.supports(larql_compute::Capability::PerLayerEmbeddings);
+    let ple_dim = if use_ple {
         weights.arch.per_layer_embed_dim()
     } else {
         0
     };
     // Helper closure: precompute the per-layer-input table for one token
-    // and upload it onto the Metal backend. Mirrors
+    // and hand it to the backend's PLE upload. Mirrors
     // `precompute_per_layer_inputs` for a single position.
-    #[cfg(all(feature = "metal", target_os = "macos"))]
-    let upload_ple =
-        |metal: &larql_compute_metal::MetalBackend, token_id: u32, embed_row: &[f32]| {
-            let embed_arr = ndarray::Array2::from_shape_vec((1, hidden), embed_row.to_vec())
-                .unwrap_or_else(|_| ndarray::Array2::<f32>::zeros((1, hidden)));
-            let per_layer_inputs =
-                crate::forward::ple::precompute_per_layer_inputs(weights, &embed_arr, &[token_id]);
-            let num_layers = weights.num_layers;
-            let mut flat: Vec<f32> = Vec::with_capacity(num_layers * ple_dim);
-            for layer_arr in &per_layer_inputs {
-                for v in layer_arr.row(0).iter() {
-                    flat.push(*v);
-                }
+    let upload_ple_closure = |token_id: u32, embed_row: &[f32]| {
+        let embed_arr = ndarray::Array2::from_shape_vec((1, hidden), embed_row.to_vec())
+            .unwrap_or_else(|_| ndarray::Array2::<f32>::zeros((1, hidden)));
+        let per_layer_inputs =
+            crate::forward::ple::precompute_per_layer_inputs(weights, &embed_arr, &[token_id]);
+        let num_layers = weights.num_layers;
+        let mut flat: Vec<f32> = Vec::with_capacity(num_layers * ple_dim);
+        for layer_arr in &per_layer_inputs {
+            for v in layer_arr.row(0).iter() {
+                flat.push(*v);
             }
-            metal.prepare_ple_inputs(&flat, num_layers, ple_dim);
-        };
-
-    #[cfg(all(feature = "metal", target_os = "macos"))]
-    let h_vec = match prefill::prefill_for_streaming(
-        weights,
-        backend,
-        &layers,
-        hidden,
-        intermediate,
-        token_ids,
-        &x,
-        qk_norm_val,
-        softcap_val,
-        metal_ple,
-        &upload_ple,
-    ) {
-        Ok(v) => v,
-        Err(err) => return GenerateResult::empty_error(err),
+        }
+        backend.prepare_ple_inputs(&flat, num_layers, ple_dim);
     };
-    #[cfg(not(all(feature = "metal", target_os = "macos")))]
+    let upload_ple: Option<UploadPleFn> = if use_ple {
+        Some(&upload_ple_closure)
+    } else {
+        None
+    };
+
     let h_vec = match prefill::prefill_for_streaming(
         weights,
         backend,
@@ -331,6 +301,7 @@ where
         &x,
         qk_norm_val,
         softcap_val,
+        upload_ple,
     ) {
         Ok(v) => v,
         Err(err) => return GenerateResult::empty_error(err),
@@ -398,7 +369,6 @@ where
     };
 
     // ── Phase 2: GPU decode loop ──
-    #[cfg(all(feature = "metal", target_os = "macos"))]
     let outcome = decode_loop::run_decode_loop(
         weights,
         tokenizer,
@@ -416,28 +386,7 @@ where
         &mut generated_ids,
         current_token_id,
         max_tokens,
-        metal_ple,
-        &upload_ple,
-        &mut on_token,
-    );
-    #[cfg(not(all(feature = "metal", target_os = "macos")))]
-    let outcome = decode_loop::run_decode_loop(
-        weights,
-        tokenizer,
-        index,
-        backend,
-        &layers,
-        hidden,
-        intermediate,
-        norm_offset,
-        knn_k,
-        &runtime,
-        &mut sampler,
-        &mut detok,
-        eos,
-        &mut generated_ids,
-        current_token_id,
-        max_tokens,
+        upload_ple,
         &mut on_token,
     );
 

@@ -339,6 +339,70 @@ round); 104 files at 90% default (was 86); 42 debt baselines (was
 suites pass; clippy clean. No file outside the won't-split list is
 ≥800 LOC.
 
+### HF LFS multipart upload for files >5 GB
+**Impact**: `larql publish` fails on any vindex with a single file >5 GB
+(Granite 4.1 30B `gate_vectors.bin` is 16 GB, `interleaved_kquant.bin`
+is also 16 GB). Today users have to drop down to a Python escape hatch
+(`huggingface_hub.HfApi().upload_folder(...)`) for the big files.
+**Effort**: 1–2 days
+**Status**: Pending (2026-05-17)
+
+`format/huggingface/publish/lfs/stream.rs::stream_put_with_progress`
+does a single `reqwest::blocking::Body::sized(...)` PUT to the
+batch-returned signed URL. HF's LFS batch endpoint refuses single-PUT
+on files >5 GB with `400 Bad Request: "You need to configure your
+repository to enable upload of files > 5GB"`. The fix is to extend the
+LFS protocol implementation to honour the multipart-response shape:
+
+1. **Batch request** — keep as-is, but pass the `transfer` flag for
+   multipart in the request body when local size exceeds the threshold
+   (HF's `lfs/objects/batch` response then carries an `actions.upload`
+   object with `parts: [{href, headers, ...}]` instead of a single
+   `href` + `header`).
+2. **`upload.actions.upload.parts` parsing** — extend
+   `lfs/batch.rs::parse_batch_response` to handle both shapes (single
+   `href` for ≤5 GB, parts list for larger). Map into a new
+   `UploadAction::Multipart { parts: Vec<PartUrl> }` variant.
+3. **Chunked streaming PUT** — in `lfs/stream.rs`, when the action is
+   `Multipart`, stream the file in `part_size`-byte chunks (typically
+   the per-part size HF returns is 5 GB; AWS S3 multipart max is also
+   5 GB per part / 10 000 parts), PUT each part with its signed URL
+   concurrently (parallelism = 3–4 to match the HF Xet client),
+   collect the response `ETag`s.
+4. **Multipart complete** — POST the collected ETags to the
+   `complete` URL HF returns in `actions.upload.completionUrl` (or
+   equivalent in the batch response — confirm exact JSON shape from
+   `https://github.com/git-lfs/git-lfs/blob/main/docs/api/batch.md`'s
+   multipart extension).
+5. **Verify + commit pointer** — unchanged.
+
+Acceptance bar:
+- `larql publish output/granite-4.1-30b-q4k.vindex --repo
+  chrishayuk/granite-4.1-30b-q4k-vindex --slices none` completes
+  without the manual Python escape hatch.
+- Existing single-PUT path stays bit-identical for files ≤5 GB
+  (parity test on a synthetic 100 MB vindex).
+- Resume-on-retry: if a part PUT fails after the batch step, retry
+  that part only (current single-PUT code already restarts the whole
+  file).
+- Progress callbacks fire per-part so `PublishCallbacks` sees the
+  same `bytes_sent` granularity it does today.
+
+References:
+- HF LFS batch endpoint docs:
+  https://github.com/git-lfs/git-lfs/blob/main/docs/api/batch.md
+- `huggingface_hub` Rust SDK doesn't exist; the Python SDK switched
+  to Xet (block-level CAS, 64 MB xorbs, global dedup) — a future
+  "Option B" once `xet-core` is a polished crates.io dep, but LFS
+  multipart is the right portable next step.
+- Diagnosed and worked around 2026-05-17 during Granite 4.1 30B
+  publish: 3B + 8B uploaded fine through the existing path; 30B's
+  16 GB `gate_vectors.bin` tripped the limit. Resume command in
+  conversation history; xet-staged chunks in
+  `~/.cache/huggingface/xet/` already content-addressed so the
+  manual Python resume picks up where the failed `larql publish`
+  left off.
+
 ### Production-path `unwrap`/`expect` triage (review finding 2026-05-10)
 **Impact**: Crash-safety on I/O failures
 **Effort**: Small

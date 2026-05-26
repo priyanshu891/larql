@@ -239,6 +239,7 @@ fn run_with_mode(
         WalkFfnConfig {
             k_per_layer,
             activation_floor: 0.0,
+            ..WalkFfnConfig::default()
         },
     );
 

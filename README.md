@@ -42,6 +42,11 @@ larql list
 larql run gemma-3-4b-it-vindex "The capital of France is"
 larql run gemma-3-4b-it-vindex          # drops into chat mode
 
+# Multi-modal — describe an image (Gemma 3 + SigLIP, prefix-only)
+larql run gemma3-4b-v2 --image photo.jpg \
+    --mm-weights ~/.cache/huggingface/hub/models--google--gemma-3-4b-it/snapshots/<hash> \
+    "Describe this image in one sentence."
+
 # Or extract locally — inference-ready at f16 by default
 larql extract google/gemma-3-4b-it -o gemma3-4b.vindex
 larql run gemma3-4b.vindex "Einstein is known for"
@@ -363,6 +368,9 @@ larql-vindex      Vindex lifecycle: extract, load, query, mutate, patch, save
 larql-core        Graph algorithms, merge, diff
 larql-inference   Forward pass, BLAS-fused attention, Metal GPU (macOS), WalkFfn
     ↓
+larql-kv          Pluggable KV-cache engines — 9 implementations, state-policy
+                  classified (canonical vs derivative), W10 mask cascade
+    ↓
 larql-lql         LQL parser, executor, REPL, USE REMOTE client
     ↓
 larql-server      HTTP/gRPC server: serve vindexes over the network
@@ -394,6 +402,55 @@ let trace = patched.walk(&query, &layers, 10);    // multi-layer scan
 patched.insert_feature(layer, feature, gate_vec, meta);
 patched.apply_patch(VindexPatch::load("edits.vlp")?);
 ```
+
+### larql-kv
+
+**LARQL KV engines separate model continuation state from execution
+cache.** Standard engines store K/V as state. Residual-state engines
+store the residual stream and derive K/V only when execution needs
+it. The choice changes how the engine composes with the dispatch
+hot path — and as of 2026-05-21, the three derivative-K/V engines
+match `standard`'s fused-kernel speed because they can elide the
+GPU→CPU state bridge entirely (W10 mask cascade, default-on).
+
+State Policy classifies every engine as a triple `(canonical_state,
+derivative_state, correctness_contract)` — the same compression
+ratio with K/V slotted canonical vs derivative gives a 13% tok/s
+delta on Metal, which the per-engine bench numbers confirm.
+
+| Engine | Canonical state | K/V role | Contract | Bench (tok/s) |
+|---|---|---|---|---:|
+| `standard` | K/V tensors | canonical | exact logits | 97.6 |
+| `no-cache` | tokens | recomputed | exact logits | (debug) |
+| `markov-rs` | residual stream | derivative | exact logits under arch contract | **98.0** |
+| `markov-rs-codec` | compressed residuals | derivative | bounded KL | **98.1** |
+| `boundary-per-layer` | per-layer codec residuals | derivative | bounded KL per-layer | **98.7** |
+| `unlimited-context` | KV (within window) + checkpoints | derivative | exact within window | 94.2 |
+| `turbo-quant` | quantised K/V | canonical (destructive) | bounded KL | 85.0 |
+| `boundary-kv` | K/V + boundary frames | canonical | exact logits | composes `standard` |
+| `apollo` | boundary retrieval store | n/a (retrieval) | task-level | orthogonal |
+
+Gemma 3 4B Q4K, Metal, M3 Max, 50 decode tokens, W10 default-on
+(2026-05-21).
+
+> *KV cache is an implementation detail. Continuation state is the
+> real abstraction.*
+
+```bash
+# Pick an engine — same trait, different state policy
+larql run gemma3-4b "The capital of France is" --engine markov-rs
+larql run gemma3-4b "The capital of France is" --engine markov-rs-codec
+larql run gemma3-4b "The capital of France is" --engine boundary-per-layer:window=512
+
+# Bench the ladder
+larql bench gemma3-4b-q4k-v2 --engine "standard;markov-rs;boundary-per-layer:layers=34"
+```
+
+See [crates/larql-kv/README.md](crates/larql-kv/README.md) for the
+full engine catalog, [crates/larql-kv/docs/state-policy.md](crates/larql-kv/docs/state-policy.md)
+for the `(canonical, derivative, contract)` framing, and
+[crates/larql-kv/PERFORMANCE.md](crates/larql-kv/PERFORMANCE.md)
+for the bench protocol + W10 mask cascade detail.
 
 ### larql-lql
 
@@ -728,6 +785,10 @@ The full surface is documented in `crates/larql-inference/ROADMAP.md` §
 | [docs/lql-guide.md](docs/lql-guide.md) | LQL quick start guide |
 | [docs/cli.md](docs/cli.md) | CLI reference |
 | [docs/inference-engine.md](docs/inference-engine.md) | Inference engine — BLAS-fused attention, Metal GPU, auto-calibration |
+| [crates/larql-kv/README.md](crates/larql-kv/README.md) | **KV engines** — 9 pluggable implementations, state-policy classified, W10 mask cascade |
+| [crates/larql-kv/docs/state-policy.md](crates/larql-kv/docs/state-policy.md) | **State Policy** — `(canonical_state, derivative_state, correctness_contract)` framing; why the K/V slot choice predicts perf |
+| [crates/larql-kv/PERFORMANCE.md](crates/larql-kv/PERFORMANCE.md) | KV engine bench protocol, W10 default-on result (2026-05-21), per-engine perf decomposition |
+| [crates/larql-inference/docs/specs/kv-engine-unification.md](crates/larql-inference/docs/specs/kv-engine-unification.md) | KV engine unification — single `KvEngine` trait dispatch through `larql run` / `walk` / `bench` |
 | [docs/ffn-graph-layer.md](docs/ffn-graph-layer.md) | FFN graph layer — mmap walk faster than dense (517ms vs 535ms), all 34 layers |
 | [docs/walk-boundary-sweep.md](docs/walk-boundary-sweep.md) | Walk boundary sweep — correctness proof across all layer boundaries |
 | [docs/residual-trace.md](docs/residual-trace.md) | Residual stream trace — decomposition, storage, tiered context |
@@ -744,7 +805,7 @@ The full surface is documented in `crates/larql-inference/ROADMAP.md` §
 
 | Platform | Compiles | GPU | BLAS |
 |----------|----------|-----|------|
-| macOS arm64 (M-series) | ✓ | Metal (`--features metal`) | Accelerate |
+| macOS arm64 (M-series) | ✓ | Metal (`--features gpu`) | Accelerate |
 | Linux arm64 / x86_64 | ✓ | — (CPU fallback) | OpenBLAS |
 | Windows arm64 / x86_64 | ✓ | — (CPU fallback) | OpenBLAS |
 
@@ -754,11 +815,11 @@ macOS gets Metal GPU acceleration. Linux and Windows run the same CPU path (BLAS
 
 ```bash
 cargo build --release                    # optimised build
-cargo build --release --features metal   # with Metal GPU backend (macOS only)
+cargo build --release --features gpu     # with GPU backend (Metal on macOS today; Vulkan/CUDA later)
 cargo test                               # all tests across all crates
 .venv/bin/python scripts/diagnose_models.py    # cross-engine correctness sweep — see below
 cargo test -p larql-inference            # inference engine tests (109 tests)
-cargo test -p larql-inference --features metal  # + Metal GPU tests (115 tests)
+cargo test -p larql-inference --features gpu    # + GPU tests (115 tests)
 cargo test -p larql-lql                  # LQL parser + executor tests (272 tests)
 cargo test -p larql-vindex               # vindex storage + patch tests (525 tests as of 2026-05-08)
 
@@ -776,8 +837,8 @@ make larql-vindex-coverage-html          # HTML report plus the same policy gate
 cargo run --release -p larql-inference --example attention_demo    # fused attention demo
 cargo run --release -p larql-inference --example mech_interp_demo  # capture / lens / ablate / steer / patch (synthetic — no vindex)
 cargo run --release -p larql-inference --example bench_attention   # attention benchmarks
-cargo run --release -p larql-inference --example backend_demo --features metal   # backend demo
-cargo run --release -p larql-inference --example bench_backend --features metal  # backend benchmarks
+cargo run --release -p larql-inference --example backend_demo --features gpu   # backend demo
+cargo run --release -p larql-inference --example bench_backend --features gpu  # backend benchmarks
 cargo run --release -p larql-inference --example bench_inference   # full inference benchmarks
 
 # Vindex tools (build once, enables mmap walk)

@@ -10,11 +10,11 @@
 #![allow(dead_code)]
 
 /// Build a `MetalBackend`. Panics with a clear message if Metal isn't
-/// available — these tests are gated on `--features metal`, but the
+/// available — these tests are gated on `--features gpu`, but the
 /// host still has to expose a Metal device.
 pub fn get_metal() -> larql_compute_metal::MetalBackend {
     larql_compute_metal::MetalBackend::new().expect(
-        "Metal device required for these tests (rerun with --features metal on Apple Silicon)",
+        "Metal device required for these tests (rerun with --features gpu on Apple Silicon)",
     )
 }
 

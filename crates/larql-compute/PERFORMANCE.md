@@ -305,7 +305,7 @@ shader to default — it implements the three-step diagnostic pinned in
 **Step 1 — capture a baseline** (commit `main` or whatever `HEAD` you trust):
 
 ```bash
-cargo run --release --features metal -p larql-compute --example diag_shader_bench -- \
+cargo run --release --features gpu -p larql-compute --example diag_shader_bench -- \
   --profile gemma3 \
   --json /tmp/larql-shaders-baseline.json
 ```
@@ -313,7 +313,7 @@ cargo run --release --features metal -p larql-compute --example diag_shader_benc
 **Step 2 — change the shader, then compare:**
 
 ```bash
-cargo run --release --features metal -p larql-compute --example diag_shader_bench -- \
+cargo run --release --features gpu -p larql-compute --example diag_shader_bench -- \
   --profile gemma3 \
   --compare /tmp/larql-shaders-baseline.json \
   --json /tmp/larql-shaders-current.json \
@@ -432,7 +432,7 @@ class of fix.
 
 ## Per-kernel profiling (2026-04-26, M3 Max, Gemma 3 4B shapes)
 
-Run: `cargo run --release --features metal -p larql-compute --example diag_profile_kernels`
+Run: `cargo run --release --features gpu -p larql-compute --example diag_profile_kernels`
 
 Two measurement modes:
 - **Isolated**: one commit+wait per call (includes ~20µs GPU spin-up overhead)

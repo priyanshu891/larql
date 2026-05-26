@@ -7,6 +7,17 @@
 fragility differences to push cold-tier compression past what a
 uniform codec can safely achieve.
 
+> **State Policy slot**: `(canonical = per-layer codec residuals,
+> derivative = `rs.stored` when windowless, contract =
+> bounded_KL(ε_l) per-layer; calibrated)`. K/V is **never**
+> shadowed by this engine — it's recomputed from residuals at
+> overflow time. Under W10 (default-on 2026-05-21) the engine
+> additionally drops `rs.stored` when `window=None` and reaches
+> the None mask, hitting `standard`'s fused-kernel speed
+> (98.7 tok/s — the fastest of the per-layer engines, marginally
+> ahead of `standard`'s 97.6). See
+> [state-policy.md §3.1](../../../larql-kv/docs/state-policy.md).
+
 This is engine 3 of 3 in the boundary-engine series. The siblings are
 [`BoundaryKvEngine`](boundary-kv-engine.md) (transport / save-restore,
 no in-session change) and
@@ -388,6 +399,40 @@ doc.
 
 If per-position codec choice ever earns its complexity, it slots in
 here. Out of scope for v0.1; flagged in §3 as a non-promise.
+
+### Phase 2.5 — Performance & module shape (landed 2026-05-20)
+
+Two O(N²) bugs + the dense-walk perf gap that materialised once the
+engine was actually benched against `markov_residual_codec`:
+
+- **Bug A (hot-tier rebuild)**: each `decode_step` rebuilt every
+  layer's `stored[layer]` via `Array2::zeros + .assign` —
+  O(N · num_layers · hidden) per step → O(N²) total in unbounded
+  mode. Replaced with `ndarray::Array2::push_row` (amortised O(m)).
+- **Bug B (cold_kv nuke)**: every overflow set `cold_kv = None`,
+  forcing the next decode step to recompute K/V over the entire
+  decoded cold tier → O(N²) windowed-mode decode. Replaced with
+  `cold_tier::extend_cold_kv_with_overflow` (appends K/V on each
+  overflow at the pre-`cold_encoded.append` absolute position so
+  RoPE is correct). Validated 100% token agreement vs
+  `markov_residual_codec` on Gemma 3 4B Q4K via
+  `examples/boundary_per_layer_parity_gate.rs`.
+- **W1-GPU dispatch**: ported `markov_residual_codec`'s
+  `try_prefill_via_dispatch` / `decode_step_via_dispatch` pattern.
+  91.8 tok/s vs codec's 92.6 (−0.9%) on Gemma 3 4B, M3 Max; 44%
+  less hot memory (19.6 MB vs 35.3 MB) since this port doesn't
+  shadow hot K/V — backend's KV cache is canonical, hot K/V is
+  recomputed at overflow extension time.
+- **FFN routing**: `run_prefill` / `run_decode` previously hardcoded
+  `BackendFfn` which needed dense FFN weights — broke on `--compact`
+  vindexes. Now honours the caller-supplied `&dyn FfnBackend`.
+- **Module split** of `engines/boundary_per_layer/engine.rs` (1250
+  → 716 LOC) into sibling files `walk.rs` / `dispatch.rs` /
+  `executor.rs` / `cold_tier.rs`, mirroring
+  `markov_residual_codec`'s layout. Free-function pattern; engine
+  struct fields are `pub(super)` for sibling-module access.
+
+CHANGELOG entry: 2026-05-20.
 
 ## 10. Open questions
 

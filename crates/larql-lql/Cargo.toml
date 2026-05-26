@@ -22,10 +22,10 @@ thiserror = { workspace = true }
 
 [features]
 default = []
-# Enable Metal-accelerated paths in `larql-compute` / `larql-inference`.
-# Mirrors the features in those crates so workspace tests can be built
-# with `--features metal` from this package.
-metal = ["dep:larql-compute-metal", "larql-inference/metal", "larql-vindex/metal"]
+# Umbrella for GPU-backend support. Mirrors the `gpu` feature in
+# `larql-compute` / `larql-inference` / `larql-vindex` so workspace
+# tests can be built with `--features gpu` from this package.
+gpu = ["dep:larql-compute-metal", "larql-inference/gpu", "larql-vindex/gpu"]
 
 [dev-dependencies]
 criterion = "0.5"

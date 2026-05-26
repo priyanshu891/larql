@@ -7,7 +7,8 @@
 //!   1. GPU: norm → QKV → RoPE → KV cache → attend → O proj → residual
 //!   2. CPU: pre-FFN norm → walk FFN (gate KNN → sparse down) → residual add
 //!
-//! Requires `--features metal` for GPU attention.
+//! Backends that don't claim [`Capability::HybridAttention`] return `None`
+//! from the trait method, and the wrapper falls back to `predict_honest`.
 
 use super::CachedLayerGraph;
 #[allow(unused_imports)]
@@ -17,7 +18,9 @@ use larql_compute::prelude::*;
 
 /// Hybrid decode: GPU attention + vindex walk FFN per layer.
 ///
-/// Falls back to `predict_honest` if Metal is unavailable or walk data is missing.
+/// Falls back to `predict_honest` if the backend lacks
+/// [`Capability::HybridAttention`] or the vindex is missing walk
+/// data / attention weights.
 #[allow(clippy::too_many_arguments)]
 pub fn predict_hybrid(
     weights: &ModelWeights,
@@ -29,21 +32,17 @@ pub fn predict_hybrid(
     cached_layers: &CachedLayerGraph,
     layer_range: std::ops::Range<usize>,
 ) -> crate::forward::PredictResult {
-    // Try the Metal hybrid path
-    #[cfg(all(feature = "metal", target_os = "macos"))]
-    {
-        if let Some(result) = predict_hybrid_metal(
-            weights,
-            tokenizer,
-            token_ids,
-            top_k,
-            index,
-            backend,
-            cached_layers,
-            &layer_range,
-        ) {
-            return result;
-        }
+    if let Some(result) = predict_hybrid_gpu(
+        weights,
+        tokenizer,
+        token_ids,
+        top_k,
+        index,
+        backend,
+        cached_layers,
+        &layer_range,
+    ) {
+        return result;
     }
 
     // Fallback: predict_honest (GPU decode_token with dense FFN)
@@ -59,10 +58,11 @@ pub fn predict_hybrid(
     )
 }
 
-/// Metal-specific hybrid implementation.
-#[cfg(all(feature = "metal", target_os = "macos"))]
+/// Backend-agnostic hybrid implementation. Dispatches through
+/// [`ComputeBackend::hybrid_decode_attention_layer`]; any GPU backend
+/// that claims [`Capability::HybridAttention`] participates.
 #[allow(clippy::too_many_arguments)]
-fn predict_hybrid_metal(
+fn predict_hybrid_gpu(
     weights: &ModelWeights,
     tokenizer: &tokenizers::Tokenizer,
     token_ids: &[u32],
@@ -72,10 +72,10 @@ fn predict_hybrid_metal(
     cached_layers: &CachedLayerGraph,
     layer_range: &std::ops::Range<usize>,
 ) -> Option<crate::forward::PredictResult> {
-    // Check: Metal backend?
-    let metal = backend
-        .as_any()
-        .downcast_ref::<larql_compute_metal::MetalBackend>()?;
+    // Check: backend supports hybrid attention dispatch?
+    if !backend.supports(Capability::HybridAttention) {
+        return None;
+    }
 
     // Check: walk data available?
     let gate_index: &dyn larql_vindex::GateIndex = index;
@@ -141,23 +141,19 @@ fn predict_hybrid_metal(
     for (rel_idx, abs_layer) in layer_range.clone().enumerate() {
         let x_vec: Vec<f32> = h.row(h.shape()[0] - 1).to_vec();
 
-        // GPU: attention only
-        let h_post_attn_vec = {
-            let layer = &attn_layers[rel_idx];
-            let layer_q_dim = layer.num_q_heads * layer.head_dim;
-            let layer_kv_dim = layer.num_kv_heads * layer.head_dim;
-            let mut cache_guard = metal.kv_cache_mut_for_shapes(&kv_shapes);
-            let kv_cache = cache_guard.as_mut().unwrap();
-            metal.decode_attention_layer(
-                kv_cache,
-                layer,
-                abs_layer,
-                &x_vec,
-                hidden,
-                layer_q_dim,
-                layer_kv_dim,
-            )
-        };
+        // GPU: attention only — backend owns the KV cache + dispatch.
+        let layer = &attn_layers[rel_idx];
+        let layer_q_dim = layer.num_q_heads * layer.head_dim;
+        let layer_kv_dim = layer.num_kv_heads * layer.head_dim;
+        let h_post_attn_vec = backend.hybrid_decode_attention_layer(
+            layer,
+            abs_layer,
+            &x_vec,
+            hidden,
+            layer_q_dim,
+            layer_kv_dim,
+            &kv_shapes,
+        )?;
 
         // CPU: walk FFN
         let h_post_attn = ndarray::Array2::from_shape_vec((1, hidden), h_post_attn_vec)

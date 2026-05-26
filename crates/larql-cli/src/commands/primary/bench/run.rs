@@ -7,7 +7,7 @@ use larql_kv::EngineKind;
 use crate::commands::primary::cache;
 
 use super::args::BenchArgs;
-use super::engine_runtime::{run_engine, run_engine_q4k};
+use super::engine_runtime::run_engine;
 use super::grid_lan_runtime::{self, GridLanOptions};
 use super::helpers;
 use super::local_runtime::run_larql;
@@ -158,38 +158,12 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
             let kv_ref_bytes =
                 larql_kv::markov_residual::kv_memory_bytes_for_seq(&weights, token_ids.len());
 
-            for engine_name in EngineKind::split_specs(engine_list) {
-                match EngineKind::from_name(&engine_name) {
-                    Some(kind) => {
-                        let backend = if want_metal {
-                            larql_inference::default_engine_backend()
-                        } else {
-                            larql_inference::cpu_engine_backend()
-                        };
-                        rows.push(run_engine_q4k(
-                            &mut weights,
-                            &index,
-                            &token_ids,
-                            kv_ref_bytes,
-                            kind,
-                            backend,
-                            &args,
-                        )?);
-                    }
-                    None => eprintln!(
-                        "unknown engine {:?} — supported: standard, no-cache, markov-rs, unlimited-context, turbo-quant, apollo",
-                        engine_name
-                    ),
-                }
-            }
-        } else {
-            let weights = larql_vindex::load_model_weights(&vindex_path, &mut cb)?;
-            let tokenizer = larql_vindex::load_vindex_tokenizer(&vindex_path)?;
-            let token_ids =
-                larql_inference::encode_prompt(&tokenizer, &*weights.arch, args.prompt.as_str())
-                    .map_err(|e| format!("tokenize: {e}"))?;
-            let kv_ref_bytes =
-                larql_kv::markov_residual::kv_memory_bytes_for_seq(&weights, token_ids.len());
+            // Parse + validate --ffn-policy once before the engine loop
+            // (multi-engine sweep reuses the same validated policy).
+            // Q4K path accepts but doesn't yet honor — engine_runtime
+            // logs a warning if non-None.
+            let validated_policy =
+                parse_ffn_policy(args.ffn_policy.as_deref(), weights.num_layers)?;
 
             for engine_name in EngineKind::split_specs(engine_list) {
                 match EngineKind::from_name(&engine_name) {
@@ -200,17 +174,62 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                             larql_inference::cpu_engine_backend()
                         };
                         rows.push(run_engine(
-                            &weights,
+                            &mut weights,
+                            Some(&index),
                             &token_ids,
                             kv_ref_bytes,
                             kind,
                             backend,
+                            validated_policy.as_ref(),
                             &args,
                         )?);
                     }
                     None => eprintln!(
-                        "unknown engine {:?} — supported: standard, no-cache, markov-rs, unlimited-context, turbo-quant, apollo",
-                        engine_name
+                        "unknown engine {:?} — supported: {}",
+                        engine_name,
+                        EngineKind::supported_names().join(", "),
+                    ),
+                }
+            }
+        } else {
+            // `&mut` so the unified `run_engine` signature works for the
+            // dense path too (`run_engine` requires &mut for the quant
+            // path's lazy dequant; the dense path reborrows immutably
+            // inside).
+            let mut weights = larql_vindex::load_model_weights(&vindex_path, &mut cb)?;
+            let tokenizer = larql_vindex::load_vindex_tokenizer(&vindex_path)?;
+            let token_ids =
+                larql_inference::encode_prompt(&tokenizer, &*weights.arch, args.prompt.as_str())
+                    .map_err(|e| format!("tokenize: {e}"))?;
+            let kv_ref_bytes =
+                larql_kv::markov_residual::kv_memory_bytes_for_seq(&weights, token_ids.len());
+
+            let validated_policy =
+                parse_ffn_policy(args.ffn_policy.as_deref(), weights.num_layers)?;
+
+            for engine_name in EngineKind::split_specs(engine_list) {
+                match EngineKind::from_name(&engine_name) {
+                    Some(kind) => {
+                        let backend = if want_metal {
+                            larql_inference::default_engine_backend()
+                        } else {
+                            larql_inference::cpu_engine_backend()
+                        };
+                        rows.push(run_engine(
+                            &mut weights,
+                            None,
+                            &token_ids,
+                            kv_ref_bytes,
+                            kind,
+                            backend,
+                            validated_policy.as_ref(),
+                            &args,
+                        )?);
+                    }
+                    None => eprintln!(
+                        "unknown engine {:?} — supported: {}",
+                        engine_name,
+                        EngineKind::supported_names().join(", "),
                     ),
                 }
             }
@@ -370,4 +389,23 @@ fn auto_default_threads() -> usize {
     {
         0
     }
+}
+
+/// Parse + validate the `--ffn-policy <spec>` flag value. Returns
+/// `None` when the flag was omitted; `Some(validated)` when a spec
+/// was provided. Surfaces parse / validation errors with a `--ffn-policy:`
+/// prefix so the user sees which flag failed.
+fn parse_ffn_policy(
+    spec: Option<&str>,
+    num_layers: usize,
+) -> Result<Option<larql_inference::ffn_policy::ValidatedFfnLayerPolicy>, Box<dyn std::error::Error>>
+{
+    let Some(spec) = spec else {
+        return Ok(None);
+    };
+    let validated = larql_inference::ffn_policy::FfnLayerPolicy::from_spec(spec)
+        .map_err(|e| format!("--ffn-policy parse: {e}"))?
+        .validate_for(num_layers)
+        .map_err(|e| format!("--ffn-policy validation: {e}"))?;
+    Ok(Some(validated))
 }

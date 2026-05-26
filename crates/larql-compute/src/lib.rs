@@ -13,10 +13,22 @@
 //!
 //! - [`MatMul`] — f32 / f16 matmul, gemv, batch matmul
 //! - [`QuantMatVec`] — unified `quant_matvec` + per-format pre-quantised helpers
-//! - [`DecodeBackend`] — KV-cached decode + prefill + MoE hook
+//! - [`DecodeBackend`] — KV-cached decode + prefill + MoE hook +
+//!   W10 `decode_token_with_state_dump_masked`
 //! - umbrella `ComputeBackend` — `name`, `device_info`, [`Capability`] probe
 //!
 //! `use larql_compute::prelude::*;` brings every sub-trait in scope at once.
+//!
+//! ## State handles + W10 mask cascade
+//!
+//! [`state_handle`] — opaque references to per-layer state rows and slabs
+//! that may live on different devices or remote nodes. Used together with
+//! [`StateDumpMask`] (`{Full, HOnly, None}`) and the
+//! `*_with_state_dump_masked` / `*_with_state_masked` trait methods to let
+//! engines that treat K/V as derivative state skip the GPU→CPU bridge.
+//! Defaults preserve `Full` behaviour everywhere; the mask is a per-engine
+//! opt-in (see `crates/larql-kv/docs/state-policy.md` and the per-engine
+//! W10 sections in `crates/larql-inference/docs/specs/*-engine.md`).
 //!
 //! ## Backends
 //!
@@ -61,10 +73,32 @@
 ))]
 extern crate blas_src;
 
+pub mod async_compute_backend;
+pub mod attention;
 pub mod backend;
+pub mod connectors;
 pub mod cpu;
+pub mod encoders;
+pub mod ffn;
+pub mod forward;
+pub mod forward_overrides;
+pub mod kquant_forward;
+pub mod kv_dispatch;
+pub mod kv_index;
 pub mod options;
+pub mod per_layer_decode_state;
 pub mod pipeline;
+pub mod pipeline_layer;
+pub mod residual;
+pub mod state_handle;
+
+/// Synthetic test fixtures (Q4K `KvIndex` builder). Behind the
+/// `test-utils` feature — production builds never see it.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_fixtures;
+
+pub use kv_index::{KvIndex, FFN_COMPONENTS_PER_LAYER};
+pub use per_layer_decode_state::PerLayerDecodeState;
 
 // ── Re-exports: pipeline types ──
 
@@ -79,8 +113,8 @@ pub use pipeline::{
 // ── Re-exports: backend ──
 
 pub use backend::{
-    dot_proj_gpu, matmul_gpu, Capability, ComputeBackend, DecodeBackend, MatMul, MatMulOp,
-    QuantMatVec,
+    dot_proj_gpu, matmul_gpu, Capability, ComputeBackend, DecodeBackend, DecodeStateDump, MatMul,
+    MatMulOp, ProfileTimings, QuantMatVec, StateDumpMask,
 };
 
 /// Bring every backend sub-trait into scope at once.
@@ -104,17 +138,17 @@ pub use cpu::CpuBackend;
 /// macOS via Accelerate, OpenBLAS on Linux/Windows).
 ///
 /// Callers that want GPU compose an explicit fallback chain via the
-/// relevant backend crate:
+/// relevant backend crate (requires a workspace dep on the backend
+/// crate, so this is shown `ignore` here — `larql-compute` doesn't
+/// take `larql-compute-metal` as a dep to avoid the circular pull):
 ///
-/// ```rust,no_run
-/// # #[cfg(target_os = "macos")] {
+/// ```rust,ignore
 /// use larql_compute::{cpu_backend, ComputeBackend};
 ///
 /// let backend: Box<dyn ComputeBackend> =
 ///     larql_compute_metal::metal_backend()
 ///         .map(|m| Box::new(m) as Box<dyn ComputeBackend>)
 ///         .unwrap_or_else(|| cpu_backend());
-/// # }
 /// ```
 ///
 /// [`default_backend`] is a synonym kept for backwards compatibility

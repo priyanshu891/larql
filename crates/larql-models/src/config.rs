@@ -117,6 +117,12 @@ pub struct ModelConfig {
     // MLA fields
     pub kv_lora_rank: Option<usize>,
     pub q_lora_rank: Option<usize>,
+    /// DS-V3 MLA: non-RoPE part of head dim (nope). qk_head_dim = qk_nope_head_dim + qk_rope_head_dim.
+    pub qk_nope_head_dim: Option<usize>,
+    /// DS-V3 MLA: RoPE part of head dim.
+    pub qk_rope_head_dim: Option<usize>,
+    /// DS-V3 MLA: V head dim (may differ from qk_nope+rope total).
+    pub v_head_dim: Option<usize>,
     // RoPE scaling
     pub rope_scaling: Option<RopeScaling>,
     // Softcapping (Gemma2)
@@ -151,6 +157,8 @@ pub struct ModelConfig {
     /// Number of layers at the end of the model that share KV from earlier layers.
     /// E.g., 20 means the last 20 layers reuse KV cache from earlier source layers.
     pub num_kv_shared_layers: Option<usize>,
+    /// Whether the model's config.json contains a `vision_config` section.
+    pub has_vision_config: bool,
 }
 
 /// Architecture-specific behavior. Describes how a model is structured
@@ -791,6 +799,21 @@ pub trait ModelArchitecture: Send + Sync {
         None
     }
 
+    /// DS-V3 MLA: non-RoPE head dim (nope). Combined qk_head_dim = nope + rope.
+    fn mla_qk_nope_head_dim(&self) -> Option<usize> {
+        None
+    }
+
+    /// DS-V3 MLA: RoPE head dim portion.
+    fn mla_qk_rope_head_dim(&self) -> Option<usize> {
+        None
+    }
+
+    /// DS-V3 MLA: V head dim (after absorption may differ from qk dims).
+    fn mla_v_head_dim(&self) -> Option<usize> {
+        None
+    }
+
     // ── RoPE scaling ──
 
     /// RoPE scaling type (None, "linear", "yarn", "dynamic", "llama3").
@@ -838,6 +861,21 @@ pub trait ModelArchitecture: Send + Sync {
     /// and frequency-band thresholds. Consumed by
     /// `larql-inference::attention::rope::apply_rope_partial_at_full`.
     fn llama3_rope_scaling(&self) -> Option<Llama3RopeScaling> {
+        None
+    }
+
+    /// Multi-modal contract for this architecture, if any.
+    ///
+    /// Returns `None` for text-only models (the default). Architectures
+    /// that accept images / audio override to return a stable reference
+    /// to a `MultiModalProtocol` impl describing their placeholder
+    /// convention, expected encoder family, token budget, and scaling
+    /// rules.
+    ///
+    /// Phase 0: every existing impl uses the default `None`. Adding
+    /// `Some(...)` returns is a Phase 1+ concern, gated on the
+    /// `EmbeddingPlan` consumer landing in `larql-compute`.
+    fn multimodal(&self) -> Option<&dyn crate::multimodal::MultiModalProtocol> {
         None
     }
 }

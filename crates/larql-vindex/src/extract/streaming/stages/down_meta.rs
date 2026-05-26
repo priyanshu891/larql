@@ -6,7 +6,7 @@ use crate::error::VindexError;
 use crate::extract::constants::FEATURE_PROJECTION_BATCH;
 use crate::extract::stage_labels::*;
 use crate::extract::streaming::context::StreamingContext;
-use crate::extract::streaming::tensor_io::{get_tensor_f32, normalize_key};
+use crate::extract::streaming::tensor_io::normalize_key;
 use crate::format::filenames::*;
 
 impl<'a> StreamingContext<'a> {
@@ -47,8 +47,12 @@ impl<'a> StreamingContext<'a> {
 
         let prefixes: Vec<&str> = self.prefixes.iter().map(|s| s.as_str()).collect();
         let down_layer_count = if resumed_down { 0 } else { self.num_layers };
-        for (layer, layer_down_meta) in all_down_meta.iter_mut().enumerate().take(down_layer_count)
-        {
+        // Index-based loop (rather than `iter_mut().enumerate()`) so the
+        // mutable borrow on `all_down_meta[layer]` is released between
+        // iterations — letting the per-layer incremental flush below take
+        // an immutable borrow of the whole accumulator.
+        for layer in 0..down_layer_count {
+            let layer_down_meta = &mut all_down_meta[layer];
             self.callbacks
                 .on_layer_start(COMP_DOWN, layer, self.num_layers);
             let start = std::time::Instant::now();
@@ -57,16 +61,23 @@ impl<'a> StreamingContext<'a> {
             let down_matrices: Vec<Array2<f32>> = if self.expert_format
                 == larql_models::ExpertFormat::PackedMxfp4
             {
-                // MXFP4: dequantize down_proj_blocks
+                // MXFP4: dequantize down_proj_blocks. Safetensors-only —
+                // GGUF has no equivalent packed-MXFP4 format.
+                let (shard_mmaps, tensor_index) = match self.tensor_source.safetensors_view() {
+                    Some(v) => v,
+                    None => {
+                        self.callbacks.on_layer_done(COMP_DOWN, layer, 0.0);
+                        continue;
+                    }
+                };
                 let blocks_key = self.arch.packed_down_blocks_key(layer).unwrap_or_default();
                 let scales_key = self.arch.packed_down_scales_key(layer).unwrap_or_default();
-                if let (Some(bi), Some(si)) = (
-                    self.tensor_index.get(&blocks_key),
-                    self.tensor_index.get(&scales_key),
-                ) {
-                    let bst = safetensors::SafeTensors::deserialize(&self.shard_mmaps[bi.0].mmap)
+                if let (Some(bi), Some(si)) =
+                    (tensor_index.get(&blocks_key), tensor_index.get(&scales_key))
+                {
+                    let bst = safetensors::SafeTensors::deserialize(&shard_mmaps[bi.0].mmap)
                         .map_err(|e| VindexError::Parse(e.to_string()))?;
-                    let sst = safetensors::SafeTensors::deserialize(&self.shard_mmaps[si.0].mmap)
+                    let sst = safetensors::SafeTensors::deserialize(&shard_mmaps[si.0].mmap)
                         .map_err(|e| VindexError::Parse(e.to_string()))?;
                     let bv = bst
                         .tensor(&bi.1)
@@ -101,7 +112,7 @@ impl<'a> StreamingContext<'a> {
                 // Expert down matrices live per-layer at `layers/layer_{L:02}.weights`
                 // (Q4_K), written by the q4k weight writer.
                 let down_key = normalize_key(&self.arch.ffn_down_key(layer), &prefixes);
-                match get_tensor_f32(&self.shard_mmaps, &self.tensor_index, &down_key)? {
+                match self.tensor_source.get_tensor_f32(&down_key)? {
                     Some(t) => vec![t],
                     None => {
                         self.callbacks.on_layer_done(COMP_DOWN, layer, 0.0);
@@ -113,8 +124,7 @@ impl<'a> StreamingContext<'a> {
                 for expert in 0..self.n_experts {
                     if let Some(key) = self.arch.expert_ffn_down_key(layer, expert) {
                         let nk = normalize_key(&key, &prefixes);
-                        if let Some(t) = get_tensor_f32(&self.shard_mmaps, &self.tensor_index, &nk)?
-                        {
+                        if let Some(t) = self.tensor_source.get_tensor_f32(&nk)? {
                             mats.push(t);
                         }
                     }
@@ -122,7 +132,7 @@ impl<'a> StreamingContext<'a> {
                 mats
             } else {
                 let down_key = normalize_key(&self.arch.ffn_down_key(layer), &prefixes);
-                match get_tensor_f32(&self.shard_mmaps, &self.tensor_index, &down_key)? {
+                match self.tensor_source.get_tensor_f32(&down_key)? {
                     Some(t) => vec![t],
                     None => {
                         self.callbacks.on_layer_done(COMP_DOWN, layer, 0.0);
@@ -234,9 +244,23 @@ impl<'a> StreamingContext<'a> {
 
             self.callbacks
                 .on_layer_done(COMP_DOWN, layer, start.elapsed().as_secs_f64() * 1000.0);
+
+            // Incremental flush: after each layer's projection finishes,
+            // snapshot the accumulator to `down_meta.bin` so an interrupted
+            // run preserves completed layers. `write_binary` already uses
+            // a tempfile + atomic rename so the on-disk file is never in
+            // a partial state. Cost is one ~1.5 MB write per layer — well
+            // under the per-layer matmul time even on dense models.
+            crate::format::down_meta::write_binary(
+                self.output_dir,
+                &all_down_meta,
+                self.down_top_k,
+            )?;
         }
 
         if !resumed_down {
+            // Final write (idempotent — same content as the last
+            // per-layer snapshot above when the loop ran to completion).
             crate::format::down_meta::write_binary(
                 self.output_dir,
                 &all_down_meta,

@@ -1,6 +1,20 @@
 //! `MarkovResidualCodecEngine` — `KvEngine` implementation.
+//!
+//! Implementation is split across sibling modules (mirrors the layout
+//! used by `boundary_per_layer`):
+//!
+//! - this file: struct + construction + `KvEngine` trait glue
+//! - [`super::walk`] — CPU dense walk path
+//!   (`rs_prefill_codec_walk` / `rs_decode_step_codec_walk`)
+//! - [`super::compute`] — Q4K-native walk path
+//!   (`rs_prefill_codec` / `rs_decode_step_codec`)
+//! - [`super::dispatch`] — W1-GPU dispatch fast path with W10 mask
+//!   cascade
+//! - [`super::executor`] — `LayerExecutor`-driven path
+//! - [`super::helpers`] — W8.2 doubling-capacity buffer helpers
 
 use larql_inference::ffn::FfnBackend;
+use larql_inference::kv_engine::EngineError;
 use larql_inference::model::ModelWeights;
 use larql_inference::{cpu_engine_backend, EngineBackend};
 use ndarray::Array2;
@@ -12,15 +26,21 @@ use crate::engines::markov_residual_codec::store::RsStoreCodec;
 use crate::engines::markov_residual_codec::walk::{
     rs_decode_step_codec_walk, rs_prefill_codec_walk,
 };
-use crate::{EngineInfo, KvEngine};
+use crate::profiler::EngineProfiler;
+use crate::{DecodeStageSummary, EngineInfo, KvEngine};
 
 /// `MarkovResidualCodecEngine` — `MarkovResidualEngine` with a codec-encoded
 /// cold tier.
 pub struct MarkovResidualCodecEngine {
-    window_size: Option<usize>,
-    codec: ColdResidualCodec,
-    store: Option<RsStoreCodec>,
-    backend: Box<dyn EngineBackend>,
+    pub(super) window_size: Option<usize>,
+    pub(super) codec: ColdResidualCodec,
+    pub(super) store: Option<RsStoreCodec>,
+    pub(super) backend: Box<dyn EngineBackend>,
+    pub(super) profiling: bool,
+    pub(super) profile: EngineProfiler,
+    /// W1-GPU: see `MarkovResidualEngine::kv_handle`.
+    pub(super) kv_handle: Option<larql_inference::KvHandle>,
+    pub(super) abs_position: usize,
 }
 
 impl MarkovResidualCodecEngine {
@@ -40,7 +60,16 @@ impl MarkovResidualCodecEngine {
             codec,
             store: None,
             backend,
+            profiling: false,
+            profile: EngineProfiler::default(),
+            kv_handle: None,
+            abs_position: 0,
         }
+    }
+
+    pub fn with_profiling(mut self, enabled: bool) -> Self {
+        self.profiling = enabled;
+        self
     }
 
     pub fn codec(&self) -> ColdResidualCodec {
@@ -51,6 +80,14 @@ impl MarkovResidualCodecEngine {
         self.store.as_ref().map_or(0, |s| s.memory_bytes())
     }
 }
+
+// The W1-GPU dispatch methods (`try_prefill_via_dispatch` /
+// `decode_step_via_dispatch`) and executor-driven helpers
+// (`prefill_via_executor_impl` / `decode_step_via_executor_impl`)
+// live as additional `impl MarkovResidualCodecEngine` blocks in
+// sibling files [`super::dispatch`] and [`super::executor`]. They
+// mutate `store` / `kv_handle` / `abs_position` / `profile` (all
+// `pub(super)`).
 
 impl KvEngine for MarkovResidualCodecEngine {
     fn name(&self) -> &str {
@@ -80,7 +117,10 @@ impl KvEngine for MarkovResidualCodecEngine {
         weights: &ModelWeights,
         _ffn: &dyn FfnBackend,
         token_ids: &[u32],
-    ) -> Option<Array2<f32>> {
+    ) -> Result<Array2<f32>, EngineError> {
+        if token_ids.is_empty() {
+            return Err(EngineError::EmptyPrompt);
+        }
         let result = rs_prefill_codec(
             weights,
             token_ids,
@@ -90,7 +130,7 @@ impl KvEngine for MarkovResidualCodecEngine {
         );
         let hidden = result.hidden.clone();
         self.store = Some(result.store);
-        Some(hidden)
+        Ok(hidden)
     }
 
     fn decode_step(
@@ -98,11 +138,19 @@ impl KvEngine for MarkovResidualCodecEngine {
         weights: &ModelWeights,
         _ffn: &dyn FfnBackend,
         token_id: u32,
-    ) -> Option<Array2<f32>> {
-        let rs = self.store.take()?;
-        let (hidden, new_rs) = rs_decode_step_codec(weights, token_id, rs, self.backend.as_ref())?;
+    ) -> Result<Array2<f32>, EngineError> {
+        let rs = self
+            .store
+            .take()
+            .ok_or_else(|| EngineError::InvariantViolation {
+                what: "decode_step called before prefill (store missing)".into(),
+            })?;
+        let (hidden, new_rs) = rs_decode_step_codec(weights, token_id, rs, self.backend.as_ref())
+            .ok_or_else(|| EngineError::BackendFailure {
+            details: "rs_decode_step_codec returned None".into(),
+        })?;
         self.store = Some(new_rs);
-        Some(hidden)
+        Ok(hidden)
     }
 
     fn memory_bytes(&self) -> usize {
@@ -124,12 +172,17 @@ impl KvEngine for MarkovResidualCodecEngine {
         index: &larql_inference::larql_vindex::VectorIndex,
         token_ids: &[u32],
         backend: &dyn larql_compute::ComputeBackend,
-    ) -> Option<Array2<f32>> {
-        // Engine state policy IS the codec-encoded residual walk path.
-        // No fused-backend bypass: callers who want the fused fast path
-        // pick `StandardEngine` explicitly. Dequant attention tensors,
-        // then route through `rs_prefill_codec_walk` (Q4K-aware FFN via
-        // WalkFfn + Q4K-native K/V via `recompute_kv(Some(index))`).
+    ) -> Result<Array2<f32>, EngineError> {
+        if token_ids.is_empty() {
+            return Err(EngineError::EmptyPrompt);
+        }
+        // W1-GPU path: try the dispatch route first (see
+        // `MarkovResidualEngine::try_prefill_via_dispatch` for the design
+        // notes). Same shape: prefill captures per-layer h_in / K_new /
+        // V_new in one backend call; engine reads the dump.
+        if let Some(hidden) = self.try_prefill_via_dispatch(weights, index, token_ids) {
+            return Ok(hidden);
+        }
         ensure_attn_tensors_dequantised(weights, index);
         let result = rs_prefill_codec_walk(
             weights,
@@ -141,7 +194,9 @@ impl KvEngine for MarkovResidualCodecEngine {
         );
         let hidden = result.hidden.clone();
         self.store = Some(result.store);
-        Some(hidden)
+        self.kv_handle = None;
+        self.abs_position = token_ids.len();
+        Ok(hidden)
     }
 
     fn decode_step_quant(
@@ -151,12 +206,38 @@ impl KvEngine for MarkovResidualCodecEngine {
         index: &larql_inference::larql_vindex::VectorIndex,
         token_id: u32,
         backend: &dyn larql_compute::ComputeBackend,
-    ) -> Option<Array2<f32>> {
+    ) -> Result<Array2<f32>, EngineError> {
+        if self.kv_handle.is_some() {
+            return self
+                .decode_step_via_dispatch(weights, index, token_id)
+                .ok_or_else(|| EngineError::BackendFailure {
+                    details: "decode_step_via_dispatch returned None".into(),
+                });
+        }
         ensure_attn_tensors_dequantised(weights, index);
-        let rs = self.store.take()?;
-        let (hidden, new_rs) = rs_decode_step_codec_walk(weights, index, token_id, rs, backend)?;
+        let rs = self
+            .store
+            .take()
+            .ok_or_else(|| EngineError::InvariantViolation {
+                what: "decode_step_quant called before prefill (store missing)".into(),
+            })?;
+        let prof = self.profiling.then_some(&mut self.profile);
+        let (hidden, new_rs) = rs_decode_step_codec_walk(
+            weights, index, token_id, rs, backend, prof,
+        )
+        .ok_or_else(|| EngineError::BackendFailure {
+            details: "rs_decode_step_codec_walk returned None".into(),
+        })?;
         self.store = Some(new_rs);
-        Some(hidden)
+        self.abs_position += 1;
+        Ok(hidden)
+    }
+
+    fn stage_summary(&self) -> Option<DecodeStageSummary> {
+        if !self.profiling || self.profile.decode_total.count == 0 {
+            return None;
+        }
+        Some(self.profile.summary("markov-rs-codec", self.backend.name()))
     }
 
     // ── Phase 2 migration: executor-driven path ──────────────────────────
@@ -173,79 +254,21 @@ impl KvEngine for MarkovResidualCodecEngine {
         ffn: &dyn FfnBackend,
         index: &larql_inference::larql_vindex::VectorIndex,
         token_ids: &[u32],
-    ) -> Option<Array2<f32>> {
-        use crate::engines::markov_residual::recompute_kv;
-        use crate::engines::markov_residual_codec::store::EncodedColdLayer;
-        use larql_inference::attention::SharedKV;
-        use larql_inference::forward::embed_tokens_pub;
+    ) -> Result<Array2<f32>, EngineError> {
         use larql_inference::layer_executor::ExecutorDispatchKind;
-        use ndarray::Array2;
-
+        if token_ids.is_empty() {
+            return Err(EngineError::EmptyPrompt);
+        }
         // Per spec §3.4: this engine's state policy (codec cold tier)
         // requires per-layer dispatch. Transparent degrade on fused
         // executor until Phase 3's refusal contract lands.
         if matches!(executor.dispatch_kind(), ExecutorDispatchKind::Fused) {
             return self.prefill_quant(weights, ffn, index, token_ids, executor.backend());
         }
-
-        ensure_attn_tensors_dequantised(weights, index);
-
-        let backend = executor.backend();
-        let num_layers = weights.num_layers;
-        let seq_len = token_ids.len();
-        let hidden_size = weights.hidden_size;
-        let mut h = embed_tokens_pub(weights, token_ids);
-        let mut stored: Vec<Array2<f32>> = Vec::with_capacity(num_layers);
-
-        for layer in 0..num_layers {
-            stored.push(h.clone());
-            let (h_out, _kv) = executor.run_prefill_layer(weights, layer, &h, ffn)?;
-            h = h_out;
-        }
-
-        let mut rs = RsStoreCodec {
-            stored,
-            cold_encoded: None,
-            cold_kv: None,
-            cold_abs_start: 0,
-            next_position: seq_len,
-            max_window: self.window_size,
-            codec: self.codec,
-        };
-
-        let mut overflow_per_layer: Vec<Array2<f32>> = Vec::with_capacity(num_layers);
-        for layer in 0..num_layers {
-            overflow_per_layer.push(rs.clip_layer_overflow(layer));
-        }
-        if overflow_per_layer.first().map_or(0, |c| c.shape()[0]) > 0 {
-            let mut encoded_layers: Vec<EncodedColdLayer> = Vec::with_capacity(num_layers);
-            let mut cold_kv: Vec<SharedKV> = Vec::with_capacity(num_layers);
-            for (layer, overflow) in overflow_per_layer.iter().enumerate() {
-                // Round-trip through the codec so cold K/V is computed
-                // from the bf16-reconstructed residuals (matches what
-                // future decode steps will see).
-                let mut tmp = EncodedColdLayer::empty(hidden_size);
-                tmp.append(self.codec, overflow);
-                let decoded = tmp.decode(self.codec);
-                let (k, v) = recompute_kv(weights, &decoded, layer, 0, backend, Some(index))
-                    .expect("cold K/V pre-computation failed");
-                cold_kv.push((k, v));
-                let mut enc = EncodedColdLayer::empty(hidden_size);
-                enc.append(self.codec, overflow);
-                encoded_layers.push(enc);
-            }
-            rs.cold_encoded = Some(encoded_layers);
-            rs.cold_kv = Some(cold_kv);
-            rs.cold_abs_start = 0;
-        }
-
-        let hidden = {
-            use ndarray::s;
-            let last = h.shape()[0] - 1;
-            h.slice(s![last..=last, ..]).to_owned()
-        };
-        self.store = Some(rs);
-        Some(hidden)
+        self.prefill_via_executor_impl(weights, executor, ffn, index, token_ids)
+            .ok_or_else(|| EngineError::BackendFailure {
+                details: "prefill_via_executor_impl returned None".into(),
+            })
     }
 
     fn decode_step_quant_via_executor(
@@ -255,128 +278,15 @@ impl KvEngine for MarkovResidualCodecEngine {
         ffn: &dyn FfnBackend,
         index: &larql_inference::larql_vindex::VectorIndex,
         token_id: u32,
-    ) -> Option<Array2<f32>> {
-        use crate::engines::markov_residual::recompute_kv;
-        use crate::engines::markov_residual_codec::store::EncodedColdLayer;
-        use larql_inference::attention::SharedKV;
-        use larql_inference::forward::embed_tokens_pub;
+    ) -> Result<Array2<f32>, EngineError> {
         use larql_inference::layer_executor::ExecutorDispatchKind;
-        use ndarray::{s, Array2};
-
         if matches!(executor.dispatch_kind(), ExecutorDispatchKind::Fused) {
             return self.decode_step_quant(weights, ffn, index, token_id, executor.backend());
         }
-
-        ensure_attn_tensors_dequantised(weights, index);
-
-        let backend = executor.backend();
-        let rs = self.store.take()?;
-        let num_layers = weights.num_layers;
-        let abs_position = rs.next_position;
-        let mut h_new = embed_tokens_pub(weights, &[token_id]);
-        let mut new_stored: Vec<Array2<f32>> = Vec::with_capacity(num_layers);
-
-        for layer in 0..num_layers {
-            let h_hot = &rs.stored[layer];
-            let s_hot = h_hot.shape()[0];
-            let hot_abs_start = abs_position.saturating_sub(s_hot);
-
-            let prior_kv: SharedKV = if let Some(cold_kv) = &rs.cold_kv {
-                let (k_cold, v_cold) = &cold_kv[layer];
-                let (k_hot, v_hot) =
-                    recompute_kv(weights, h_hot, layer, hot_abs_start, backend, Some(index))?;
-                let c = k_cold.shape()[0];
-                let kv_dim = k_cold.shape()[1];
-                let mut k_combined = Array2::<f32>::zeros((c + s_hot, kv_dim));
-                k_combined.slice_mut(s![..c, ..]).assign(k_cold);
-                k_combined.slice_mut(s![c.., ..]).assign(&k_hot);
-                let mut v_combined = Array2::<f32>::zeros((c + s_hot, kv_dim));
-                v_combined.slice_mut(s![..c, ..]).assign(v_cold);
-                v_combined.slice_mut(s![c.., ..]).assign(&v_hot);
-                (k_combined, v_combined)
-            } else {
-                let (h_full, full_abs_start) = match &rs.cold_encoded {
-                    Some(cold_layers) if cold_layers[layer].n_positions > 0 => {
-                        let decoded = cold_layers[layer].decode(rs.codec);
-                        let hidden = h_hot.shape()[1];
-                        let mut combined =
-                            Array2::<f32>::zeros((decoded.shape()[0] + s_hot, hidden));
-                        combined
-                            .slice_mut(s![..decoded.shape()[0], ..])
-                            .assign(&decoded);
-                        combined
-                            .slice_mut(s![decoded.shape()[0].., ..])
-                            .assign(h_hot);
-                        (combined, rs.cold_abs_start)
-                    }
-                    _ => (h_hot.clone(), hot_abs_start),
-                };
-                recompute_kv(
-                    weights,
-                    &h_full,
-                    layer,
-                    full_abs_start,
-                    backend,
-                    Some(index),
-                )?
-            };
-
-            new_stored.push(h_new.clone());
-            let (h_out, _new_kv) =
-                executor.run_decode_layer(weights, layer, &h_new, &prior_kv, abs_position, ffn)?;
-            h_new = h_out;
-        }
-
-        // Append new row + clip overflow into encoded cold tier.
-        let mut updated_stored: Vec<Array2<f32>> = Vec::with_capacity(num_layers);
-        for (stored, new_row) in rs.stored.iter().zip(new_stored.iter()) {
-            let s_old = stored.shape()[0];
-            let hidden_dim = stored.shape()[1];
-            let mut combined = Array2::<f32>::zeros((s_old + 1, hidden_dim));
-            combined.slice_mut(s![..s_old, ..]).assign(stored);
-            combined.slice_mut(s![s_old.., ..]).assign(new_row);
-            updated_stored.push(combined);
-        }
-
-        let mut updated_rs = RsStoreCodec {
-            stored: updated_stored,
-            cold_encoded: rs.cold_encoded,
-            cold_kv: rs.cold_kv,
-            cold_abs_start: rs.cold_abs_start,
-            next_position: abs_position + 1,
-            max_window: rs.max_window,
-            codec: rs.codec,
-        };
-
-        let mut overflow_per_layer: Vec<Array2<f32>> = Vec::with_capacity(num_layers);
-        for layer in 0..num_layers {
-            overflow_per_layer.push(updated_rs.clip_layer_overflow(layer));
-        }
-        if overflow_per_layer.first().map_or(0, |c| c.shape()[0]) > 0 {
-            match updated_rs.cold_encoded.as_mut() {
-                Some(layers) => {
-                    for (layer, overflow) in overflow_per_layer.iter().enumerate() {
-                        layers[layer].append(updated_rs.codec, overflow);
-                    }
-                }
-                None => {
-                    let hidden = weights.hidden_size;
-                    let mut layers: Vec<EncodedColdLayer> = Vec::with_capacity(num_layers);
-                    for overflow in overflow_per_layer.iter() {
-                        let mut enc = EncodedColdLayer::empty(hidden);
-                        enc.append(updated_rs.codec, overflow);
-                        layers.push(enc);
-                    }
-                    updated_rs.cold_encoded = Some(layers);
-                }
-            }
-            updated_rs.cold_kv = None;
-        }
-
-        let last = h_new.shape()[0] - 1;
-        let out = h_new.slice(s![last..=last, ..]).to_owned();
-        self.store = Some(updated_rs);
-        Some(out)
+        self.decode_step_via_executor_impl(weights, executor, ffn, index, token_id)
+            .ok_or_else(|| EngineError::BackendFailure {
+                details: "decode_step_via_executor_impl returned None".into(),
+            })
     }
 }
 
@@ -453,7 +363,7 @@ mod tests {
         let weights = make_test_weights();
         let ffn = WeightFfn { weights: &weights };
         let mut eng = MarkovResidualCodecEngine::new(None, ColdResidualCodec::Bf16);
-        assert!(eng.decode_step(&weights, &ffn, 0).is_none());
+        assert!(eng.decode_step(&weights, &ffn, 0).is_err());
     }
 
     #[test]
@@ -643,11 +553,11 @@ mod tests {
         let backend = larql_compute::cpu_backend();
         let ffn = NullFfn;
         let mut engine = MarkovResidualCodecEngine::new(None, ColdResidualCodec::Bf16);
-        // No prefill → store is None → decode_step_quant takes the None
-        // branch on `self.store.take()` and returns None.
+        // No prefill → store is None → decode_step_quant returns
+        // InvariantViolation at the `self.store.take()` guard.
         assert!(engine
             .decode_step_quant(&mut weights, &ffn, &index, 0, &*backend)
-            .is_none());
+            .is_err());
     }
 
     #[test]
@@ -764,6 +674,84 @@ mod tests {
         );
     }
 
+    /// W2 fast path for the codec engine: both cold_kv AND hot_kv
+    /// cached. Drives the triple-condition branch in
+    /// `rs_decode_step_codec_walk` that memcpy-concatenates the
+    /// cached cold tier with the cached hot tier.
+    #[test]
+    fn decode_step_quant_w2_codec_cached_hot_and_cold_steady_state() {
+        use larql_inference::ffn::NullFfn;
+        let mut weights = make_test_weights();
+        let index = larql_inference::test_utils::make_test_vindex(&weights);
+        let backend = larql_compute::cpu_backend();
+        let ffn = NullFfn;
+        let mut engine = MarkovResidualCodecEngine::new(Some(2), ColdResidualCodec::Bf16);
+        engine
+            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1, 2, 3], &*backend)
+            .expect("prefill with overflow");
+        assert!(engine.store.as_ref().unwrap().hot_kv.is_some());
+        assert!(engine.store.as_ref().unwrap().cold_kv.is_some());
+        for tok in 4u32..7 {
+            // First decode goes through cached cold+hot, then overflow
+            // invalidates cold_kv (codec is lossy), so next decode
+            // takes the recompute-via-cold_encoded path. Second decode
+            // then has cold_kv populated again (lazy rebuild via
+            // recompute) — exercises both sides of the codec's
+            // post-overflow flow.
+            let _ = engine
+                .decode_step_quant(&mut weights, &ffn, &index, tok, &*backend)
+                .expect("decode");
+        }
+    }
+
+    /// Drive the codec engine's fallback when hot_kv is None
+    /// (pre-W2 / via_executor path). Covers the cached-cold-only
+    /// arm with manual hot_kv invalidation.
+    #[test]
+    fn decode_step_quant_w2_codec_falls_back_when_hot_kv_dropped() {
+        use larql_inference::ffn::NullFfn;
+        let mut weights = make_test_weights();
+        let index = larql_inference::test_utils::make_test_vindex(&weights);
+        let backend = larql_compute::cpu_backend();
+        let ffn = NullFfn;
+        let mut engine = MarkovResidualCodecEngine::new(Some(2), ColdResidualCodec::Bf16);
+        engine
+            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1, 2, 3], &*backend)
+            .expect("prefill");
+        engine.store.as_mut().unwrap().hot_kv = None;
+        let h = engine
+            .decode_step_quant(&mut weights, &ffn, &index, 4, &*backend)
+            .expect("decode via fallback");
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+    }
+
+    /// Drive `rs_decode_step_codec_walk`'s `Some(profiler)` arms —
+    /// stage_summary returns Some only after with_profiling(true) AND
+    /// at least one decode step on the Q4K path.
+    #[test]
+    fn decode_step_codec_walk_with_profiling_populates_summary() {
+        use larql_inference::ffn::NullFfn;
+        let mut weights = make_test_weights();
+        let index = larql_inference::test_utils::make_test_vindex(&weights);
+        let backend = larql_compute::cpu_backend();
+        let ffn = NullFfn;
+        let mut eng =
+            MarkovResidualCodecEngine::new(Some(2), ColdResidualCodec::Bf16).with_profiling(true);
+        eng.prefill_quant(&mut weights, &ffn, &index, &[0u32, 1, 2, 3], &*backend)
+            .expect("prefill");
+        eng.decode_step_quant(&mut weights, &ffn, &index, 4, &*backend)
+            .expect("decode 1");
+        eng.decode_step_quant(&mut weights, &ffn, &index, 5, &*backend)
+            .expect("decode 2");
+        let summary = eng
+            .stage_summary()
+            .expect("codec walk profiler should populate summary");
+        assert_eq!(summary.engine, "markov-rs-codec");
+        assert!(summary.steps >= 2);
+        assert!(summary.avg_attention_us > 0.0);
+        assert!(summary.avg_ffn_us > 0.0);
+    }
+
     /// Decode through the executor with cold_kv pre-computed by the
     /// windowed prefill (lines ~321-333 of engine.rs).
     #[test]
@@ -845,5 +833,150 @@ mod tests {
             .decode_step_quant_via_executor(&mut weights, &exec, &ffn, &index, 2)
             .expect("fused fallback decode");
         assert_eq!(h2.shape(), &[1, weights.hidden_size]);
+    }
+
+    // ── Q4K dispatch path (try_prefill_via_dispatch + decode_step_via_dispatch) ──
+    //
+    // Mirrors the markov_residual sibling — CpuBackend's
+    // `coarse_prefill_with_state` / `coarse_decode_step_with_state_masked`
+    // fire on Q4K-backed vindexes, taking the engine down the W1-GPU
+    // dispatch path on CPU. The cold tier here is codec-encoded
+    // (bf16 round-trip) rather than raw f32.
+
+    #[test]
+    fn prefill_via_dispatch_with_q4k_vindex_populates_store_and_handle() {
+        if crate::engines::w10_enabled() {
+            // W10 opt-in drops the shadow; this test pins Full-mode
+            // population. Add a separate test for the None-mask path.
+            return;
+        }
+        use larql_inference::ffn::NullFfn;
+        use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
+        let mut weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let backend = larql_compute::cpu_backend();
+        let ffn = NullFfn;
+        let mut engine = MarkovResidualCodecEngine::new(None, ColdResidualCodec::Bf16);
+        let h = engine
+            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1, 2], &*backend)
+            .expect("dispatch-path prefill on Q4K vindex");
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+        assert!(engine.kv_handle.is_some());
+        assert!(engine.memory_bytes() > 0);
+        let store = engine.store.as_ref().expect("store populated");
+        assert_eq!(store.next_position, 3);
+        assert!(store.hot_kv.is_some());
+        // No window → no overflow → codec-encoded cold tier stays None.
+        assert!(store.cold_encoded.is_none());
+        assert!(store.cold_kv.is_none());
+    }
+
+    #[test]
+    fn decode_via_dispatch_grows_buffers_in_place() {
+        use larql_inference::ffn::NullFfn;
+        use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
+        let mut weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let backend = larql_compute::cpu_backend();
+        let ffn = NullFfn;
+        let mut engine = MarkovResidualCodecEngine::new(None, ColdResidualCodec::Bf16);
+        engine
+            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1], &*backend)
+            .expect("prefill dispatch");
+        let mem_after_prefill = engine.memory_bytes();
+        for tok in 2..6u32 {
+            let h = engine
+                .decode_step_quant(&mut weights, &ffn, &index, tok, &*backend)
+                .expect("dispatch decode step");
+            assert_eq!(h.shape(), &[1, weights.hidden_size]);
+        }
+        assert!(engine.memory_bytes() >= mem_after_prefill);
+        assert!(engine.kv_handle.is_some());
+    }
+
+    #[test]
+    fn dispatch_decode_with_profiling_runs_w10_state_capture_branches() {
+        // The codec dispatch path bumps state_capture / state_materialise /
+        // state_append but not decode_total (decode_total is the walk-path
+        // accumulator). `stage_summary` gates on decode_total > 0, so it
+        // returns None on the pure-dispatch path — this test only asserts
+        // that the profiling branches don't panic and produce finite
+        // logits.
+        use larql_inference::ffn::NullFfn;
+        use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
+        let mut weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let backend = larql_compute::cpu_backend();
+        let ffn = NullFfn;
+        let mut engine =
+            MarkovResidualCodecEngine::new(None, ColdResidualCodec::Bf16).with_profiling(true);
+        engine
+            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1], &*backend)
+            .expect("prefill");
+        let h = engine
+            .decode_step_quant(&mut weights, &ffn, &index, 2, &*backend)
+            .expect("decode 1");
+        assert!(h.iter().all(|v| v.is_finite()));
+        let h2 = engine
+            .decode_step_quant(&mut weights, &ffn, &index, 3, &*backend)
+            .expect("decode 2");
+        assert!(h2.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn dispatch_prefill_with_window_evicts_to_codec_cold_tier() {
+        // Window < prompt_len triggers the on-prefill eviction branch
+        // inside try_prefill_via_dispatch. Evicted residuals get
+        // bf16-encoded into cold_encoded; cold_kv is intentionally left
+        // None — the codec is lossy, so next-step K/V must be recomputed
+        // from the decoded payload.
+        use larql_inference::ffn::NullFfn;
+        use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
+        let mut weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let backend = larql_compute::cpu_backend();
+        let ffn = NullFfn;
+        let mut engine = MarkovResidualCodecEngine::new(Some(2), ColdResidualCodec::Bf16);
+        engine
+            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1, 2, 3], &*backend)
+            .expect("prefill with window");
+        let store = engine.store.as_ref().expect("store");
+        assert!(store.cold_encoded.is_some());
+        // Codec engine deliberately keeps cold_kv = None on overflow
+        // (decoded bf16 ≠ original f32, so any raw K/V would diverge).
+        assert!(store.cold_kv.is_none());
+        assert!(engine.window_tokens() <= 2);
+        assert!(engine.cold_bytes() > 0);
+        let cold = store.cold_encoded.as_ref().unwrap();
+        assert_eq!(cold[0].n_positions, 2);
+    }
+
+    #[test]
+    fn dispatch_decode_overflow_appends_to_codec_cold_tier() {
+        // Each decode step beyond the window evicts one residual row
+        // into the cold tier. Exercises the codec-side post-decode
+        // overflow handler: encode + append to cold_encoded payload,
+        // optionally extend cold_kv.
+        use larql_inference::ffn::NullFfn;
+        use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
+        let mut weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let backend = larql_compute::cpu_backend();
+        let ffn = NullFfn;
+        let mut engine = MarkovResidualCodecEngine::new(Some(2), ColdResidualCodec::Bf16);
+        engine
+            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1, 2], &*backend)
+            .expect("prefill at window cap");
+        for tok in 3..6u32 {
+            engine
+                .decode_step_quant(&mut weights, &ffn, &index, tok, &*backend)
+                .expect("dispatch decode with codec overflow");
+        }
+        let store = engine.store.as_ref().expect("store");
+        assert!(store.cold_encoded.is_some());
+        let cold = store.cold_encoded.as_ref().unwrap();
+        // Prefill evicted 1 row; each of 3 decode steps evicted 1 more.
+        assert!(cold[0].n_positions >= 3);
+        assert!(engine.window_tokens() <= 2);
     }
 }

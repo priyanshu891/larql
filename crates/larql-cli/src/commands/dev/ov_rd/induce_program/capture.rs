@@ -160,7 +160,7 @@ pub fn build_fit_context(
 }
 
 fn init_metal_backend() -> MetalBackendOpt {
-    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[cfg(all(feature = "gpu", target_os = "macos"))]
     {
         match larql_compute_metal::MetalBackend::new() {
             Some(b) => {
@@ -173,9 +173,9 @@ fn init_metal_backend() -> MetalBackendOpt {
             }
         }
     }
-    #[cfg(not(all(feature = "metal", target_os = "macos")))]
+    #[cfg(not(all(feature = "gpu", target_os = "macos")))]
     {
-        eprintln!("Metal backend: not compiled in (rebuild with --features metal on macOS)");
+        eprintln!("Metal backend: not compiled in (rebuild with --features gpu on macOS)");
         None
     }
 }

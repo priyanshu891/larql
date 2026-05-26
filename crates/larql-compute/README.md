@@ -12,10 +12,39 @@ The trait is split into four sub-traits, each with its own focus:
 |---|---|
 | [`MatMul`](src/backend/matmul.rs) | f32 / f16 matmul, `matmul_transb`, `f32_gemv`, `f16_gemv`, batch matmul |
 | [`QuantMatVec`](src/backend/quant_matvec.rs) | unified `quant_matvec(format, …)` + per-format pre-quantised fast paths |
-| [`DecodeBackend`](src/backend/decode.rs) | KV-cached decode + multi-position prefill + MoE hook |
+| [`DecodeBackend`](src/backend/decode.rs) | KV-cached decode + multi-position prefill + MoE hook + W10 `decode_token_with_state_dump_masked` |
 | (umbrella) `ComputeBackend` | `name`, `device_info`, `Capability`-based feature probe |
 
 Most callers stay typed against `&dyn ComputeBackend`; `use larql_compute::prelude::*;` brings every sub-trait in scope at once.
+
+### State handles + W10 state-bridge mask cascade
+
+[`state_handle`](src/state_handle.rs) — opaque references to per-layer
+state rows / slabs. Lets engines that treat K/V as **derivative** state
+(see `crates/larql-kv/docs/state-policy.md`) defer or skip the
+GPU→CPU bridge.
+
+- `StateHandle` / `SlabHandle` / `SlabSnapshot` traits — location-aware
+  (`RowLocation::{LocalCpu, LocalGpu{backend}, Remote{node_id}}`) so the
+  same surface works for grid deployments without changing engines.
+- `CpuStateHandle` — wraps an owned `Array2<f32>`; `into_array` moves
+  without a copy (CPU happy-path invariant).
+- [`StateDumpMask`](src/backend/decode.rs) `{Full, HOnly, None}` —
+  engine intent: `HOnly` skips K/V readback, `None` skips h_in too.
+  Threaded through [`DecodeBackend::decode_token_with_state_dump_masked`](src/backend/decode.rs)
+  and [`KvDispatch::coarse_decode_step_with_state_masked`](src/kv_dispatch/mod.rs).
+- `KvDispatch::read_kv_row_at` — on-demand readback of a single
+  position's K/V from the backend's kv cache. Used by engines (e.g.
+  `UnlimitedContextEngine.close_window`) that dropped their CPU
+  shadow.
+
+Default impls preserve `Full` behaviour everywhere; backends without
+an optimised path fall through. The Metal kernel honors the mask
+cascade (skips staging buffer alloc, blit, and readback per slot).
+See `crates/larql-kv/PERFORMANCE.md` for the measured cascade (markov-rs
+84.7 → 99.1 tok/s, +17%, hot mem 54 → 0 MB) and
+`crates/larql-kv/examples/w10_parity_gate.rs` for the bit-identical
+real-model parity proof.
 
 ## Adding a new quant format
 
@@ -26,7 +55,7 @@ Adding e.g. FP4 = one `QuantFormat` enum variant + one match arm in `QuantMatVec
 | Backend | Feature flag | f32 matmul | Quantized ops | Pipeline |
 |---------|-------------|------------|---------------|---------|
 | **CPU** | (always) | BLAS (Accelerate AMX) | C kernel (ARM vdotq_s32) | Sequential |
-| **Metal** | `--features metal` | Tiled shaders | Simdgroup Q4/Q4_K/Q6_K/Q8 | One command buffer |
+| **Metal** | `--features gpu` | Tiled shaders | Simdgroup Q4/Q4_K/Q6_K/Q8 | One command buffer |
 | **CUDA** | (planned) | — | — | — |
 
 ## Performance vs Ollama
@@ -227,7 +256,7 @@ src/
                       q4_common (quantizers: Q4_0, Q4_K, Q4_KF, Q6_K, GGUF Q4_K),
                       q8_matvec, vector, attention, geglu, linalg
 
-  metal/              (feature-gated: --features metal)
+  metal/              (feature-gated: --features gpu)
     mod.rs            MetalBackend (~30 pipeline handles + KV cache)
     kernel/           `KernelHandle` + `TiledKernel` trait
       handle.rs       Pipeline + geometry, bundled
@@ -324,21 +353,21 @@ Eleven examples in three groups — see [`examples/README.md`](examples/README.m
 
 ```bash
 # Demos (teach the API)
-cargo run --release --features metal -p larql-compute --example demo_basic
-cargo run --release --features metal -p larql-compute --example demo_architecture
-cargo run --release --features metal -p larql-compute --example demo_ridge_solve
+cargo run --release --features gpu -p larql-compute --example demo_basic
+cargo run --release --features gpu -p larql-compute --example demo_architecture
+cargo run --release --features gpu -p larql-compute --example demo_ridge_solve
 
 # Compares (full-pipeline benchmarks — distinct from kernel-level criterion suite)
-cargo run --release --features metal -p larql-compute --example compare_decode      # Q4_K decode latency
-cargo run --release --features metal -p larql-compute --example compare_formats     # Q4_KF vs Q4_K vs Q8
-cargo run --release --features metal -p larql-compute --example compare_generation  # End-to-end tok/s
-cargo run --release --features metal -p larql-compute --example compare_pipeline    # Q4_K fused vs Q8 fused
-cargo run --release --features metal -p larql-compute --example compare_ollama      # Head-to-head vs Ollama
+cargo run --release --features gpu -p larql-compute --example compare_decode      # Q4_K decode latency
+cargo run --release --features gpu -p larql-compute --example compare_formats     # Q4_KF vs Q4_K vs Q8
+cargo run --release --features gpu -p larql-compute --example compare_generation  # End-to-end tok/s
+cargo run --release --features gpu -p larql-compute --example compare_pipeline    # Q4_K fused vs Q8 fused
+cargo run --release --features gpu -p larql-compute --example compare_ollama      # Head-to-head vs Ollama
 
 # Diagnostic
-cargo run --release --features metal -p larql-compute --example diag_decode_pipeline
-cargo run --release --features metal -p larql-compute --example diag_profile_kernels
-cargo run --release --features metal -p larql-compute --example diag_shader_bench
+cargo run --release --features gpu -p larql-compute --example diag_decode_pipeline
+cargo run --release --features gpu -p larql-compute --example diag_profile_kernels
+cargo run --release --features gpu -p larql-compute --example diag_shader_bench
 ```
 
 The headline tok/s vs Ollama uses the CLI's `bench` subcommand against a real vindex:
@@ -375,11 +404,11 @@ divergence appeared at `ffn_out_raw` / `down_out`, pointing at the
 
 ```bash
 # Per-layer end-of-layer diff: CPU prefill vs Metal prefill
-cargo run --release --features metal -p larql-inference \
+cargo run --release --features gpu -p larql-inference \
     --example residual_diff -- <vindex> "The capital of France is"
 
 # Per-stage L0 diff: CPU prefill vs Metal KV-cached decode
-cargo run --release --features metal -p larql-inference \
+cargo run --release --features gpu -p larql-inference \
     --example stage_bisect -- <vindex> "The capital of France is" 0
 ```
 
@@ -408,7 +437,7 @@ API; the same calls back the regression suite at
 2. **One file per kernel family** — ~38 shader files under `src/metal/shaders/`, each containing related kernels
 3. **Zero-copy mmap** — `newBufferWithBytesNoCopy` for weight buffers
 4. **Safe by default** — `read_buffer_f32` with bounds checking
-5. **Feature-gated** — Metal with `--features metal`, CPU always available
+5. **Feature-gated** — Metal with `--features gpu`, CPU always available
 6. **Auto-calibration** — benchmarks CPU vs GPU at startup for routing threshold
 7. **Dual-path decode** — auto-detects Q4_K vs Q8 weights, uses optimal pipeline
 8. **GGUF-compatible** — Q4_K/Q6_K formats match Ollama's quantization

@@ -47,9 +47,15 @@ pub fn rs_prefill_codec(
 
     let hidden_size = weights.hidden_size;
     let mut rs = RsStoreCodec {
+        hot_len: stored.first().map_or(0, |s| s.shape()[0]),
         stored,
         cold_encoded: None,
         cold_kv: None,
+        // Dense (f32) prefill path doesn't capture K/V — falls back to
+        // recompute-from-residuals on decode. The Q4K walk path
+        // (`rs_prefill_codec_walk`) is what production uses, and it
+        // does capture.
+        hot_kv: None,
         cold_abs_start: 0,
         next_position: seq_len,
         max_window,
@@ -61,6 +67,7 @@ pub fn rs_prefill_codec(
     for layer in 0..num_layers {
         overflow_per_layer.push(rs.clip_layer_overflow(layer));
     }
+    rs.finalise_hot_len_after_clip();
     if overflow_per_layer.first().map_or(0, |c| c.shape()[0]) > 0 {
         let mut encoded_layers: Vec<EncodedColdLayer> = Vec::with_capacity(num_layers);
         let mut cold_kv: Vec<SharedKV> = Vec::with_capacity(num_layers);
@@ -164,9 +171,11 @@ pub fn rs_decode_step_codec(
     }
 
     let mut updated_rs = RsStoreCodec {
+        hot_len: updated_stored.first().map_or(0, |s| s.shape()[0]),
         stored: updated_stored,
         cold_encoded: rs.cold_encoded,
         cold_kv: rs.cold_kv,
+        hot_kv: rs.hot_kv,
         cold_abs_start: rs.cold_abs_start,
         next_position: abs_position + 1,
         max_window: rs.max_window,
@@ -178,6 +187,7 @@ pub fn rs_decode_step_codec(
     for layer in 0..num_layers {
         overflow_per_layer.push(updated_rs.clip_layer_overflow(layer));
     }
+    updated_rs.finalise_hot_len_after_clip();
     if overflow_per_layer.first().map_or(0, |c| c.shape()[0]) > 0 {
         match updated_rs.cold_encoded.as_mut() {
             Some(layers) => {

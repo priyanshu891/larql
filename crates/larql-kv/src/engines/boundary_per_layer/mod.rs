@@ -10,9 +10,13 @@
 //! Phase 3 calibration plan.
 
 pub mod calibration;
+pub(crate) mod cold_tier;
+pub(crate) mod dispatch;
 pub mod engine;
+pub(crate) mod executor;
 pub mod policy;
 pub mod store;
+pub(crate) mod walk;
 
 pub use calibration::{
     BoundaryCalibrationRecord, BoundaryCalibrationStore, CalibrationError, InMemoryCalibrationStore,

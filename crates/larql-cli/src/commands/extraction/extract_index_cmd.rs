@@ -282,13 +282,58 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
 
         let output = &args.output;
 
-        // Find or create tokenizer
-        let tok_path = model_path.join(TOKENIZER_JSON);
+        // Detect GGUF source. `resolve_model_path` returns either a directory
+        // (safetensors or GGUF) or a single `.gguf` file. We classify here so
+        // we can pick the right loader and resolve sibling files (tokenizer,
+        // HF metadata) from the correct directory.
+        let is_gguf_file = model_path.is_file()
+            && model_path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"));
+        let gguf_dir = if model_path.is_dir() {
+            std::fs::read_dir(&model_path)
+                .ok()
+                .and_then(|entries| {
+                    entries.filter_map(|e| e.ok()).map(|e| e.path()).find(|p| {
+                        p.extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+                    })
+                })
+                .filter(|_| {
+                    // Only treat the dir as GGUF if no safetensors are present.
+                    std::fs::read_dir(&model_path)
+                        .map(|entries| {
+                            !entries.filter_map(|e| e.ok()).any(|e| {
+                                e.path()
+                                    .extension()
+                                    .is_some_and(|ext| ext.eq_ignore_ascii_case("safetensors"))
+                            })
+                        })
+                        .unwrap_or(false)
+                })
+        } else {
+            None
+        };
+        let is_gguf_source = is_gguf_file || gguf_dir.is_some();
+
+        // Sibling-file lookup directory: a `.gguf` file's siblings live in
+        // its parent; a model directory's siblings are itself.
+        let sibling_dir = if model_path.is_file() {
+            model_path
+                .parent()
+                .ok_or_else(|| format!("model path has no parent: {}", model_path.display()))?
+                .to_path_buf()
+        } else {
+            model_path.clone()
+        };
+
+        // Find or load tokenizer (sibling to the GGUF file or in the model dir).
+        let tok_path = sibling_dir.join(TOKENIZER_JSON);
         let tokenizer = if tok_path.exists() {
             larql_vindex::tokenizers::Tokenizer::from_file(&tok_path)
                 .map_err(|e| format!("failed to load tokenizer: {e}"))?
         } else {
-            return Err(format!("tokenizer.json not found at {}", model_path.display()).into());
+            return Err(format!("tokenizer.json not found at {}", tok_path.display()).into());
         };
 
         let weight_opts = larql_vindex::WriteWeightsOptions {
@@ -330,27 +375,102 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
             );
         }
 
-        larql_vindex::build_vindex_streaming(
-            &model_path,
-            &tokenizer,
-            model_name,
-            output,
-            args.down_top_k,
-            level,
-            dtype,
-            args.quant,
-            weight_opts,
-            q4k_opts,
-            args.drop_gate_vectors,
-            &mut callbacks,
-        )?;
+        // Dispatch:
+        //
+        //  - Safetensors (always) and GGUF at browse level go through the
+        //    streaming pipeline — no full model in RAM.
+        //  - GGUF at inference / attention / all levels (or any level
+        //    with `--quant q4k`) still hits the in-memory loader: the
+        //    `StreamingWeights` writer subsystem is safetensors-only,
+        //    and porting it to GGUF is a follow-on PR.
+        let route_gguf_through_streaming = is_gguf_source
+            && matches!(level, larql_vindex::ExtractLevel::Browse)
+            && args.quant == larql_vindex::QuantFormat::None;
+
+        if is_gguf_source && !route_gguf_through_streaming {
+            // GGUF + attention/inference/all (or any level with q4k) →
+            // in-memory loader. `load_model_dir_validated` auto-detects
+            // GGUF (single file or directory containing one) and
+            // dequantises tensors to f32, producing the `ModelWeights`
+            // shape the in-memory build path expects.
+            let load_target: std::path::PathBuf = if let Some(gguf) = gguf_dir {
+                gguf
+            } else {
+                model_path.clone()
+            };
+            eprintln!("  GGUF source detected — loading via in-memory path");
+            let weights = larql_models::load_model_dir_validated(&load_target)
+                .map_err(|e| format!("failed to load GGUF model: {e}"))?;
+
+            larql_vindex::build_vindex(
+                &weights,
+                &tokenizer,
+                model_name,
+                output,
+                args.down_top_k,
+                level,
+                dtype,
+                &mut callbacks,
+            )?;
+
+            if matches!(
+                level,
+                larql_vindex::ExtractLevel::Attention
+                    | larql_vindex::ExtractLevel::Inference
+                    | larql_vindex::ExtractLevel::All
+            ) {
+                match args.quant {
+                    larql_vindex::QuantFormat::Q4K => {
+                        larql_vindex::write_model_weights_kquant_with_opts(
+                            &weights,
+                            output,
+                            &mut callbacks,
+                            q4k_opts,
+                        )?;
+                    }
+                    larql_vindex::QuantFormat::None => {
+                        larql_vindex::write_model_weights_with_opts(
+                            &weights,
+                            output,
+                            &mut callbacks,
+                            weight_opts,
+                        )?;
+                    }
+                }
+            }
+        } else {
+            // Safetensors path (any level) OR GGUF at browse level —
+            // streaming mmap, no full model load. For GGUF, point the
+            // pipeline at the shard-1 file (or the directory; the
+            // pipeline picks the right shard internally).
+            let streaming_entry: std::path::PathBuf = if let Some(gguf) = gguf_dir.as_ref() {
+                gguf.clone()
+            } else {
+                model_path.clone()
+            };
+            larql_vindex::build_vindex_streaming(
+                &streaming_entry,
+                &tokenizer,
+                model_name,
+                output,
+                args.down_top_k,
+                level,
+                dtype,
+                args.quant,
+                weight_opts,
+                q4k_opts,
+                args.drop_gate_vectors,
+                &mut callbacks,
+            )?;
+        }
 
         // Opportunistically copy HF metadata (tokenizer_config.json,
         // special_tokens_map.json, generation_config.json) from the source
         // directory into the vindex. Chat-template-aware runtimes read
         // `tokenizer_config.json::chat_template` from here; missing files
-        // are silently skipped.
-        if let Err(e) = larql_vindex::snapshot_hf_metadata(&model_path, output) {
+        // are silently skipped. Use the sibling-file dir (parent of a GGUF
+        // file, or the model dir itself).
+        if let Err(e) = larql_vindex::snapshot_hf_metadata(&sibling_dir, output) {
             eprintln!("  warning: failed to snapshot HF metadata: {e}");
         }
     }

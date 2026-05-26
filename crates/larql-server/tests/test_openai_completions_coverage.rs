@@ -5,6 +5,21 @@
 //! prompt, echo+stream rejection, batched+stream rejection,
 //! infer_disabled rejection), the non-streaming buffered path, and
 //! the streaming SSE path.
+//!
+//! ## Why every success-path test drains the response body
+//!
+//! The buffered handler returns `Json(CompletionsResponse { … }).into_response()`.
+//! axum builds the wire body lazily — if a test only inspects
+//! `resp.status()` and drops the response without consuming
+//! `into_body()`, the response-serialisation tail of the handler
+//! never gets driven, which leaves ~50 lines of the OK branch
+//! uncovered. Pre-2026-05-20 the tests asserted
+//! `OK || is_server_error()` and dropped the response on the floor,
+//! which surfaced as completions.rs 70.34% on Ubuntu CI vs 86.85%
+//! on macOS — same test outcomes, different code reached by the
+//! llvm-cov runner. Helpers `capture_completion` + `capture_status`
+//! below now drain on every call site so the OK branch's
+//! coverage matches what callers actually exercise in production.
 
 mod common;
 
@@ -31,6 +46,19 @@ async fn post_completions(body: serde_json::Value) -> axum::http::Response<Body>
     resp
 }
 
+/// Drain the response body so the handler's lazy `into_response()`
+/// serialisation actually runs (see the file-level note for why this
+/// matters for coverage). Returns `(status, body)` so callers can
+/// assert on the body shape too.
+async fn capture_completion(resp: axum::http::Response<Body>) -> (StatusCode, String) {
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap_or_default();
+    let body_str = String::from_utf8_lossy(&body).into_owned();
+    (status, body_str)
+}
+
 #[tokio::test]
 async fn completions_non_streaming_single_prompt_returns_200() {
     let resp = post_completions(serde_json::json!({
@@ -39,9 +67,12 @@ async fn completions_non_streaming_single_prompt_returns_200() {
         "max_tokens": 4,
     }))
     .await;
-    // Either 200 (generation succeeded) or 500 (synthetic weights
-    // produced NaN) — both exercise the non-streaming compose path.
-    assert!(resp.status() == StatusCode::OK || resp.status().is_server_error());
+    let (status, body) = capture_completion(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "expected 200 OK from non-streaming completions; got {status}, body={body}"
+    );
 }
 
 #[tokio::test]
@@ -97,7 +128,12 @@ async fn completions_echo_in_non_stream_runs_echo_branch() {
         "echo": true,
     }))
     .await;
-    assert!(resp.status() == StatusCode::OK || resp.status().is_server_error());
+    let (status, body) = capture_completion(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "expected 200 OK from echo non-stream completions; got {status}, body={body}"
+    );
 }
 
 #[tokio::test]
@@ -108,7 +144,12 @@ async fn completions_batched_non_stream_runs_loop_branch() {
         "max_tokens": 2,
     }))
     .await;
-    assert!(resp.status() == StatusCode::OK || resp.status().is_server_error());
+    let (status, body) = capture_completion(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "expected 200 OK from batched non-stream completions; got {status}, body={body}"
+    );
 }
 
 #[tokio::test]
@@ -180,7 +221,12 @@ async fn completions_with_sampling_params_runs_sampler_branches() {
         "presence_penalty": 0.1,
     }))
     .await;
-    assert!(resp.status() == StatusCode::OK || resp.status().is_server_error());
+    let (status, body) = capture_completion(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "expected 200 OK from sampling-params completions; got {status}, body={body}"
+    );
 }
 
 #[tokio::test]
@@ -196,7 +242,12 @@ async fn completions_with_stop_strings_runs_stop_check_branch() {
         "stop": ["x", " "],
     }))
     .await;
-    assert!(resp.status() == StatusCode::OK || resp.status().is_server_error());
+    let (status, body) = capture_completion(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "expected 200 OK from stop-strings completions; got {status}, body={body}"
+    );
 }
 
 #[tokio::test]
@@ -208,5 +259,10 @@ async fn completions_with_logprobs_runs_logprobs_branch() {
         "logprobs": 3,
     }))
     .await;
-    assert!(resp.status() == StatusCode::OK || resp.status().is_server_error());
+    let (status, body) = capture_completion(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "expected 200 OK from logprobs completions; got {status}, body={body}"
+    );
 }

@@ -31,7 +31,7 @@
 //! suites: missing vindexes return early with a skip note unless
 //! `LARQL_ARCH_STRICT=1`.
 
-#![cfg(all(feature = "metal", target_os = "macos"))]
+#![cfg(all(feature = "gpu", target_os = "macos"))]
 
 use std::path::PathBuf;
 

@@ -76,4 +76,19 @@ pub(super) const CONTENT_TYPE_NDJSON: &str = "application/x-ndjson";
 pub(super) const LFS_OP_UPLOAD: &str = "upload";
 pub(super) const LFS_OP_VERIFY: &str = "verify";
 pub(super) const LFS_TRANSFER_BASIC: &str = "basic";
+/// HF's custom git-lfs transfer extension for files >5 GB. The batch
+/// request must declare we can speak this protocol (via the
+/// `transfers` list) — otherwise HF returns `400 Bad Request: "You
+/// need to configure your repository to enable upload of files >
+/// 5GB"` for any object that exceeds the basic-transfer single-PUT
+/// ceiling. With it declared, HF responds with a multipart-shaped
+/// `actions.upload` whose `header.chunk_size` + numbered `00001` /
+/// `00002` / … entries each hold one part's pre-signed S3 PUT URL.
+/// See `lfs/multipart.rs`.
+pub(super) const LFS_TRANSFER_MULTIPART: &str = "multipart";
 pub(super) const HASH_ALGO_SHA256: &str = "sha256";
+
+/// Header key used by HF's multipart LFS response to declare bytes
+/// per part. Presence of this key on `actions.upload.header` is the
+/// signal the upload is multipart (vs. basic single-PUT).
+pub(super) const LFS_MULTIPART_CHUNK_SIZE_HEADER: &str = "chunk_size";

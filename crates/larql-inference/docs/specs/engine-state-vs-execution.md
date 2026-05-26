@@ -424,3 +424,27 @@ symptoms; this spec describes the structural cut.
 The existing `KvDispatch` /  `FfnBackend` /  `ComputeBackend`
 separation in `larql-inference` is the right substrate; this spec is
 about engines consuming it correctly instead of re-coupling.
+
+---
+
+## 11. W10 (2026-05-18) — state-bridge mask cascade as a §2 worked example
+
+W10's `StateDumpMask` cascade and `read_kv_row_at` trait method
+(see [`kv-engine-unification.md` §4.4](./kv-engine-unification.md#44-w10-2026-05-18--state-bridge-mask-cascade))
+are this spec's principle made concrete:
+
+- The **state-policy decision** stays with the engine —
+  `MarkovResidualEngine` declares its hot K/V is derivative; the engine
+  drops the CPU shadow when configured for unbounded context.
+- The **execution decision** moves to the backend trait — `KvDispatch`
+  exposes a mask parameter; the Metal impl honors it by skipping
+  blits/readbacks, the CPU impl falls through to `Full` via the
+  default trait impl. Engines never branch on backend type to choose
+  a mask; they declare intent and let the backend execute.
+
+The cut held: every engine-side state-policy change in W10 lives in
+`crates/larql-kv/src/engines/*`, every execution-side change lives in
+`crates/larql-compute/src/kv_dispatch/`,
+`crates/larql-compute-metal/src/kv_dispatch_impl.rs`, and
+`crates/larql-compute-metal/src/decode/mod.rs`. No engine had to
+import Metal-specific types or branch on backend identity.

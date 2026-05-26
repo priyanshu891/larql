@@ -290,7 +290,7 @@ mod tests {
 
     // `dev()` previously returned `Option<Device>` so each test could
     // early-return on non-Metal hosts.  Since this module is already
-    // `#[cfg(all(feature = "metal", target_os = "macos"))]`-gated by
+    // `#[cfg(all(feature = "gpu", target_os = "macos"))]`-gated by
     // `lib.rs`, no test runner that compiles these tests is missing a
     // Metal device — the early-return branch was permanently dead
     // (uncovered region count: 10).  Panic on a missing device instead;

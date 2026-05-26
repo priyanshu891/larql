@@ -4,7 +4,7 @@
 //! wrapper so the profiler can be invoked as a standalone binary.
 //!
 //! Usage:
-//!   cargo run --release --features metal -p larql-compute --example diag_profile_kernels
+//!   cargo run --release --features gpu -p larql-compute --example diag_profile_kernels
 //!
 //! Output: GB/s per kernel in isolation AND batched (34× / cmd buffer),
 //! bottleneck classification (compute-bound vs bandwidth-bound), and the
@@ -16,7 +16,7 @@ extern crate blas_src;
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
-    eprintln!("This example requires macOS and --features metal");
+    eprintln!("This example requires macOS and --features gpu");
 }
 
 #[cfg(target_os = "macos")]

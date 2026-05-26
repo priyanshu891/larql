@@ -218,7 +218,7 @@ mod factory {
     }
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(all(feature = "gpu", target_os = "macos"))]
 mod metal_tests {
     use super::*;
     use larql_compute_metal::MetalBackend;

@@ -3,7 +3,7 @@
 //! Runs LARQL decode (Q4_K, Q8, raw kernel) then queries Ollama's API,
 //! prints a single comparison table. This is THE benchmark to run.
 //!
-//! Usage: cargo run --release --features metal -p larql-compute --example compare_ollama
+//! Usage: cargo run --release --features gpu -p larql-compute --example compare_ollama
 //!
 //! Requires: ollama running locally with gemma3:4b loaded.
 
@@ -12,7 +12,7 @@ extern crate blas_src;
 fn main() {
     #[cfg(not(target_os = "macos"))]
     {
-        println!("Run on macOS with --features metal");
+        println!("Run on macOS with --features gpu");
     }
 
     #[cfg(target_os = "macos")]

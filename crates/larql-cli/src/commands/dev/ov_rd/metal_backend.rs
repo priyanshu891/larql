@@ -5,14 +5,14 @@
 
 pub(super) type Backend = Box<dyn larql_compute::ComputeBackend + Send + Sync>;
 
-/// Initialize a Metal backend if `use_metal` is true and the `metal` feature
+/// Initialize a Metal backend if `use_metal` is true and the `gpu` feature
 /// is compiled on macOS. Logs the outcome to stderr.
 pub(super) fn init(use_metal: bool) -> Option<Backend> {
     if !use_metal {
         return None;
     }
 
-    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[cfg(all(feature = "gpu", target_os = "macos"))]
     {
         match larql_compute_metal::MetalBackend::new() {
             Some(b) => {
@@ -25,10 +25,10 @@ pub(super) fn init(use_metal: bool) -> Option<Backend> {
             }
         }
     }
-    #[cfg(not(all(feature = "metal", target_os = "macos")))]
+    #[cfg(not(all(feature = "gpu", target_os = "macos")))]
     {
         eprintln!(
-            "Metal backend: not compiled in — rebuild with `--features metal` on macOS. \
+            "Metal backend: not compiled in — rebuild with `--features gpu` on macOS. \
              Falling back to CPU."
         );
         None

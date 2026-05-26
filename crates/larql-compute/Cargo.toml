@@ -28,10 +28,25 @@ openblas-src = { version = "0.10", features = ["system"] }
 ndarray = { version = "0.16", features = ["blas"] }
 blas-src = { version = "0.10", features = ["accelerate"] }
 
+# Windows: no BLAS *backend*. The system OpenBLAS has a memory-pool
+# race that even `OPENBLAS_NUM_THREADS=1` + `OMP_NUM_THREADS=1` +
+# `RUST_TEST_THREADS=1` doesn't fully eliminate (`BLAS : Bad memory
+# unallocation!` warning, ~0.6 K-buffer drift on successive matmuls
+# producing intermittent failures across
+# larql-kv::{vindex_compare, markov_residual} self-equality tests).
+# The CI env-var fix (#124) reduced the rate but didn't close it.
+#
+# Dropping ndarray's `blas` feature on Windows routes matmul through
+# the pure-Rust path — slower on Windows production inference but
+# deterministic. `blas-src` is kept as a featureless dep so the
+# `extern crate blas_src;` declarations across this crate's tests /
+# examples / benches still compile (the crate is essentially empty
+# without a backend feature, so nothing links to OpenBLAS).
+# Mac (Accelerate) and Linux (OpenBLAS, which works correctly there)
+# are unchanged.
 [target.'cfg(target_os = "windows")'.dependencies]
-ndarray = { version = "0.16", features = ["blas"] }
-blas-src = { version = "0.10", features = ["openblas"], default-features = false }
-openblas-src = { version = "0.10", features = ["system"] }
+ndarray = "0.16"
+blas-src = { version = "0.10", default-features = false }
 
 
 [features]
@@ -40,6 +55,13 @@ default = []
 # `cargo test -p larql-compute` skips them so the dev loop stays under
 # ~10 s; CI / release runs flip this on to get coverage.
 heavy_tests = []
+# Synthetic `KvIndex` fixtures for downstream test crates. Off by
+# default so production builds never compile the fixture code. Enable
+# from a consumer's `[dev-dependencies]` entry, e.g.
+# `larql-compute = { path = "../larql-compute", features = ["test-utils"] }`.
+# Pulls in `larql-models/test-utils` for the Q4K-friendly `ModelWeights`
+# fixtures the index builder consumes.
+test-utils = ["larql-models/test-utils"]
 
 [build-dependencies]
 cc = "1.0"
@@ -51,6 +73,10 @@ libc = "0.2"
 criterion = "0.5"
 serde_json = "1"
 memmap2 = "0.9"
+# Enable `larql-models`' `test-utils` feature so the moved-down
+# forward-pass tests in this crate can construct `ModelWeights` via
+# `larql_models::test_fixtures::make_test_weights`.
+larql-models = { path = "../larql-models", features = ["test-utils"] }
 
 [[bench]]
 name = "linalg"

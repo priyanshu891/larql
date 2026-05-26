@@ -1,13 +1,13 @@
 //! Q4_KF decode benchmark: pre-baked scales vs Q4_K vs Q8.
 //!
-//! Usage: cargo run --release --features metal -p larql-compute --example compare_formats
+//! Usage: cargo run --release --features gpu -p larql-compute --example compare_formats
 
 extern crate blas_src;
 
 fn main() {
     #[cfg(not(target_os = "macos"))]
     {
-        println!("Run on macOS with --features metal");
+        println!("Run on macOS with --features gpu");
     }
 
     #[cfg(target_os = "macos")]

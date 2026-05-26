@@ -123,9 +123,9 @@ fn bench_engine_vs_legacy_generation(c: &mut Criterion) {
 
     group.bench_function("engine_dispatch_standard", |b| {
         b.iter(|| {
-            let mut engine = StandardEngine::new(None);
+            let mut engine = larql_kv::AnyEngine::Kv(Box::new(StandardEngine::new(None)));
             generate_with_engine(
-                &mut engine as &mut dyn larql_kv::KvEngine,
+                &mut engine,
                 &weights,
                 &tokenizer,
                 &ffn,
@@ -146,9 +146,11 @@ fn bench_engine_vs_legacy_generation(c: &mut Criterion) {
         use larql_inference::AsyncComputeBackend;
         b.iter(|| {
             let backend: Box<dyn AsyncComputeBackend> = Box::new(larql_compute::CpuBackend);
-            let mut engine = StandardEngine::with_async_backend(None, backend);
+            let mut engine = larql_kv::AnyEngine::Kv(Box::new(StandardEngine::with_async_backend(
+                None, backend,
+            )));
             generate_with_engine(
-                &mut engine as &mut dyn larql_kv::KvEngine,
+                &mut engine,
                 &weights,
                 &tokenizer,
                 &ffn,

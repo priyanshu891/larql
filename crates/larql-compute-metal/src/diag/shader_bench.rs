@@ -130,7 +130,7 @@ impl Config {
 }
 
 pub fn usage() -> String {
-    "Usage: cargo run --release --features metal -p larql-compute --example diag_shader_bench -- [--profile smoke|gemma3] [--warmup N] [--iters N] [--layers N] [--inventory-only] [--json PATH] [--compare PATH] [--threshold PCT]".into()
+    "Usage: cargo run --release --features gpu -p larql-compute --example diag_shader_bench -- [--profile smoke|gemma3] [--warmup N] [--iters N] [--layers N] [--inventory-only] [--json PATH] [--compare PATH] [--threshold PCT]".into()
 }
 
 fn parse_usize(value: Option<&String>, flag: &str) -> Result<usize, String> {

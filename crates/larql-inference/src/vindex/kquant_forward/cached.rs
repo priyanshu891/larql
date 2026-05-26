@@ -93,6 +93,23 @@ pub fn predict_kquant_prefill(
     token_ids: &[u32],
     index: &VectorIndex,
 ) -> (Array2<f32>, CpuKvCache, CachedTimings) {
+    predict_kquant_prefill_with_state(weights, token_ids, index, None)
+}
+
+/// Prefill with optional per-layer state capture (W1-GPU step 3
+/// sibling of [`predict_kquant_decode_step_direct_with_state`]). When
+/// `state` is `Some`, populates per-layer `h_in` ([seq_len, hidden]),
+/// `k_new` ([seq_len, kv_dim]), `v_new` ([seq_len, kv_dim]) for every
+/// position in the prompt — engines (markov_residual,
+/// unlimited_context, turbo_quant) use this to seed their state policy
+/// from a single prefill pass without a follow-up CPU re-walk. When
+/// `state` is `None`, bit-identical to [`predict_kquant_prefill`].
+pub fn predict_kquant_prefill_with_state(
+    weights: &mut ModelWeights,
+    token_ids: &[u32],
+    index: &VectorIndex,
+    mut state: Option<&mut crate::PerLayerDecodeState>,
+) -> (Array2<f32>, CpuKvCache, CachedTimings) {
     let num_layers = weights.num_layers;
     let mut cache: CpuKvCache = vec![None; num_layers];
     let mut timings = CachedTimings::default();
@@ -106,6 +123,14 @@ pub fn predict_kquant_prefill(
             insert_q4k_layer_tensors(weights, index, layer).unwrap_or_else(|err| panic!("{err}"));
         timings.dequant_ms += t0.elapsed().as_secs_f64() * 1000.0;
 
+        // Snapshot pre-attention residual for this layer if engine wants it.
+        if let Some(s) = state.as_deref_mut() {
+            s.h_in_per_layer
+                .push(larql_compute::state_handle::CpuStateHandle::boxed(
+                    h.clone(),
+                ));
+        }
+
         // Attention with K/V capture. Backend stays None — we want the
         // CPU BLAS path for the dequantised f32 tensors that
         // `insert_q4k_layer_tensors` just placed in `weights.tensors`.
@@ -117,6 +142,18 @@ pub fn predict_kquant_prefill(
                     return (h, cache, timings);
                 }
             };
+
+        if let Some(s) = state.as_deref_mut() {
+            // Prefill K/V for THIS layer = full seq_len × kv_dim.
+            s.k_new_per_layer
+                .push(larql_compute::state_handle::CpuStateHandle::boxed(
+                    k_rope.clone(),
+                ));
+            s.v_new_per_layer
+                .push(larql_compute::state_handle::CpuStateHandle::boxed(
+                    v_final.clone(),
+                ));
+        }
 
         let ffn = WeightFfn { weights };
         let (h_post_ffn, _) = run_ffn(weights, &h_post_attn, layer, &ffn, false);
@@ -427,6 +464,30 @@ pub fn fused_decode_step(
     token_id: u32,
     backend: &dyn ComputeBackend,
 ) -> Option<Array2<f32>> {
+    fused_decode_step_inner(weights, index, token_id, backend, None)
+}
+
+/// Variant of [`fused_decode_step`] that also captures per-layer state
+/// via the backend's `decode_token_with_state_dump`. Engines pass
+/// `Some(state)` to drive their state policy without a CPU re-walk.
+/// `None` is bit-identical to the non-state variant.
+pub fn fused_decode_step_with_state(
+    weights: &ModelWeights,
+    index: &VectorIndex,
+    token_id: u32,
+    backend: &dyn ComputeBackend,
+    state: &mut larql_compute::DecodeStateDump,
+) -> Option<Array2<f32>> {
+    fused_decode_step_inner(weights, index, token_id, backend, Some(state))
+}
+
+fn fused_decode_step_inner(
+    weights: &ModelWeights,
+    index: &VectorIndex,
+    token_id: u32,
+    backend: &dyn ComputeBackend,
+    state: Option<&mut larql_compute::DecodeStateDump>,
+) -> Option<Array2<f32>> {
     use crate::layer_graph::pipeline_layer::build_pipeline_layers;
     use larql_vindex::GateIndex;
 
@@ -462,7 +523,8 @@ pub fn fused_decode_step(
     let h_tok = crate::forward::embed_tokens_pub(weights, &[token_id]);
     let x_dec: Vec<f32> = h_tok.row(0).to_vec();
 
-    let h_vec = backend.decode_token(&layers, &x_dec, hidden, intermediate)?;
+    let h_vec =
+        backend.decode_token_with_state_dump(&layers, &x_dec, hidden, intermediate, state)?;
     Array2::from_shape_vec((1, hidden), h_vec).ok()
 }
 
@@ -822,6 +884,35 @@ pub fn predict_kquant_decode_step_direct(
     cache: &mut CpuKvCache,
     abs_position: usize,
 ) -> Option<Array2<f32>> {
+    predict_kquant_decode_step_direct_with_state(
+        weights,
+        token_id,
+        index,
+        backend,
+        cache,
+        abs_position,
+        None,
+    )
+}
+
+/// Decode step with optional per-layer state capture (`Some(state)`
+/// populates `h_in` / `k_new` / `v_new` per layer at near-zero cost
+/// since this CPU path already walks the layers serially). Engines
+/// that need per-layer state — `markov_residual` for residual storage,
+/// `markov_residual_codec` ditto, `turbo_quant` for per-layer K/V
+/// compression — call through here via `KvDispatch::
+/// coarse_decode_step_with_state`. When `state` is `None` this is
+/// bit-identical to [`predict_kquant_decode_step_direct`].
+pub fn predict_kquant_decode_step_direct_with_state(
+    weights: &mut ModelWeights,
+    token_id: u32,
+    index: &VectorIndex,
+    backend: &dyn ComputeBackend,
+    cache: &mut CpuKvCache,
+    abs_position: usize,
+    mut state: Option<&mut crate::PerLayerDecodeState>,
+) -> Option<Array2<f32>> {
+    use ndarray::s;
     let num_layers = weights.num_layers;
     if cache.len() != num_layers {
         return None;
@@ -831,6 +922,12 @@ pub fn predict_kquant_decode_step_direct(
     let ple_inputs = precompute_per_layer_inputs(weights, &h, &[token_id]);
 
     for layer in 0..num_layers {
+        if let Some(s) = state.as_deref_mut() {
+            s.h_in_per_layer
+                .push(larql_compute::state_handle::CpuStateHandle::boxed(
+                    h.clone(),
+                ));
+        }
         let kv_entry = cache[layer].as_ref();
         let (h_post_attn, new_kv) = attention_decode_step_native(
             weights,
@@ -841,6 +938,20 @@ pub fn predict_kquant_decode_step_direct(
             kv_entry,
             abs_position,
         )?;
+        if let Some(s) = state.as_deref_mut() {
+            // new_kv is the full prior+new K/V; the new row is the
+            // last row. Engines that cache per-layer K/V (markov_rs
+            // hot_kv, turbo_quant compressed) consume this row.
+            let n = new_kv.0.shape()[0];
+            s.k_new_per_layer
+                .push(larql_compute::state_handle::CpuStateHandle::boxed(
+                    new_kv.0.slice(s![n - 1..n, ..]).to_owned(),
+                ));
+            s.v_new_per_layer
+                .push(larql_compute::state_handle::CpuStateHandle::boxed(
+                    new_kv.1.slice(s![n - 1..n, ..]).to_owned(),
+                ));
+        }
         cache[layer] = Some(new_kv);
 
         let h_post_ffn =

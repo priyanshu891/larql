@@ -8,7 +8,7 @@
 //! caught it. This is what these benches exist for.
 //!
 //! Run: `cargo bench -p larql-compute --bench quant_matvec`
-//! Or with metal: `cargo bench -p larql-compute --features metal --bench quant_matvec`
+//! Or with metal: `cargo bench -p larql-compute --features gpu --bench quant_matvec`
 //!
 //! ## What's covered
 //!
@@ -20,7 +20,7 @@
 //!   - `prefill_10240`: N=10240 × K=2560. FFN gate/up matrix shape.
 //!   - `lm_head_262144`: N=262144 × K=2560. Vocab projection — the
 //!     row-drop regression-detector shape.
-//! - **Backends**: CPU always; Metal under `--features metal`.
+//! - **Backends**: CPU always; Metal under `--features gpu`.
 
 extern crate blas_src;
 

@@ -6,6 +6,12 @@
 //! Reference: [`WeightFfn`] + [`SparseFfn`] live here for correctness/bench
 //! comparison (see `examples/walk_correctness.rs`); they are not used in
 //! production dispatch.
+//!
+//! The [`FfnBackend`] trait + activation helpers moved to
+//! `larql-compute` (ADR-0022 Step 2c) so substrate-level forward-pass
+//! code can dispatch through it without depending on `larql-inference`.
+//! All trait impls (`WeightFfn`, `SparseFfn`, `RemoteWalkBackend`, MoE
+//! backends) stay here because they pull in inference-side topology.
 
 pub mod graph_backend;
 pub mod moe_remote;
@@ -16,39 +22,9 @@ pub mod sparse_compute;
 mod tests;
 pub mod weight;
 
-use ndarray::Array2;
-
-/// Number of elements in one Q4_K / Q8_K super-block (the block size both
-/// formats share). Hidden sizes that are not a multiple of this value
-/// can't use the block-quantised wire formats — `walk_ffn` and
-/// `grid::remote_ffn` use this for their dispatch checks. Mirrors
-/// llama.cpp's `QK_K`.
-pub const Q4K_Q8K_SUPERBLOCK_ELEMS: usize = 256;
-
-// ── Trait ──
-
-/// FFN backend trait. Defines how a single layer's FFN is computed.
-pub trait FfnBackend {
-    /// Run the FFN for a given layer on the pre-FFN-normed residual.
-    fn forward(&self, layer: usize, x: &Array2<f32>) -> Array2<f32>;
-
-    /// Run FFN and also return the pre-down activation (for capture).
-    fn forward_with_activation(&self, layer: usize, x: &Array2<f32>) -> (Array2<f32>, Array2<f32>);
-
-    /// Human-readable name for logging.
-    fn name(&self) -> &str;
-
-    /// For hybrid MoE layers: receive `h_post_attn` (post-attention, pre-FFN,
-    /// unnormalized) and return the full layer output `h_out`. Returns `None`
-    /// to fall back to local dispatch.
-    fn forward_moe_full_layer(
-        &self,
-        _layer: usize,
-        _h_post_attn: &larql_vindex::ndarray::Array2<f32>,
-    ) -> Option<larql_vindex::ndarray::Array2<f32>> {
-        None
-    }
-}
+pub use larql_compute::ffn::{
+    gelu_tanh, gelu_tanh_gate_up, sigmoid, silu_gate_up, FfnBackend, Q4K_Q8K_SUPERBLOCK_ELEMS,
+};
 
 // ── Re-exports ──
 
@@ -97,26 +73,10 @@ impl<'a> LayerFfnRouter<'a> {
     }
 }
 
-// ── Activation functions ──
-
-pub fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
-}
-
-pub fn silu_gate_up(gate: &Array2<f32>, up: &Array2<f32>) -> Array2<f32> {
-    let activated = gate.mapv(|v| v * sigmoid(v));
-    &activated * up
-}
-
-pub fn gelu_tanh_gate_up(gate: &Array2<f32>, up: &Array2<f32>) -> Array2<f32> {
-    let activated = gate.mapv(gelu_tanh);
-    &activated * up
-}
-
-pub fn gelu_tanh(x: f32) -> f32 {
-    let c = 0.797_884_6_f32;
-    0.5 * x * (1.0 + (c * (x + 0.044715 * x * x * x)).tanh())
-}
+// Activation functions (`sigmoid`, `silu_gate_up`, `gelu_tanh`,
+// `gelu_tanh_gate_up`) moved to `larql_compute::ffn` (ADR-0022 Step 2c).
+// Re-exported above at module head so existing `crate::ffn::*` paths
+// keep working.
 
 #[cfg(test)]
 mod router_tests {

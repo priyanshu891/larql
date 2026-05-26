@@ -130,7 +130,7 @@ New trait-level methods:
 
 ## 6. The trait surface (full Rust)
 
-Trait + handle types live in `crates/larql-inference/src/async_compute_backend/mod.rs`. Backend implementations are sibling submodules: `cpu.rs`, `metal.rs` (`#[cfg(feature = "metal")]`), and — when they're written — `vulkan.rs` and `cuda.rs`.
+Trait + handle types live in `crates/larql-inference/src/async_compute_backend/mod.rs`. Backend implementations are sibling submodules: `cpu.rs`, `metal.rs` (`#[cfg(feature = "gpu")]`), and — when they're written — `vulkan.rs` and `cuda.rs`.
 
 ### 6.1 Handle types
 
@@ -539,7 +539,7 @@ shape against actual `MetalBackend` ownership patterns without writing
 new shaders. No tok/s win yet — every call has CpuBackend's cost.
 
 File `crates/larql-inference/src/async_compute_backend/metal.rs` is
-behind `#[cfg(feature = "metal")]` and includes a compile-time
+behind `#[cfg(feature = "gpu")]` and includes a compile-time
 `assert_async::<MetalBackend>()` test plus bit-parity tests vs
 `CpuBackend` that auto-skip when `MetalBackend::new()` returns `None`.
 

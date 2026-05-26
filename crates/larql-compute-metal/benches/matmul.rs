@@ -6,7 +6,7 @@
 //! the production decode and lm-head paths actually run.
 //!
 //! Run: `cargo bench -p larql-compute --bench matmul`
-//! Or with metal: `cargo bench -p larql-compute --features metal --bench matmul`
+//! Or with metal: `cargo bench -p larql-compute --features gpu --bench matmul`
 //!
 //! ## What's covered
 //!

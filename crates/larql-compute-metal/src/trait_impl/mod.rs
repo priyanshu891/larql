@@ -41,7 +41,34 @@ impl ComputeBackend for MetalBackend {
                 | Capability::DecodeProfile
                 | Capability::PrefillQ4
                 | Capability::HeterogeneousAttention
+                | Capability::PerLayerEmbeddings
+                | Capability::HybridAttention
         )
+    }
+
+    fn prepare_ple_inputs(&self, flat: &[f32], num_layers: usize, ple_dim: usize) {
+        MetalBackend::prepare_ple_inputs(self, flat, num_layers, ple_dim);
+    }
+
+    fn take_split_timings(&self) -> Option<larql_compute::ProfileTimings> {
+        crate::decode::profile::take_last_split_timings()
+    }
+
+    fn hybrid_decode_attention_layer(
+        &self,
+        layer: &larql_compute::FullPipelineLayer<'_>,
+        layer_idx: usize,
+        x: &[f32],
+        hidden: usize,
+        q_dim: usize,
+        kv_dim: usize,
+        kv_shapes: &[(usize, usize)],
+    ) -> Option<Vec<f32>> {
+        let mut cache_guard = self.kv_cache_mut_for_shapes(kv_shapes);
+        let kv_cache = cache_guard.as_mut()?;
+        Some(MetalBackend::decode_attention_layer(
+            self, kv_cache, layer, layer_idx, x, hidden, q_dim, kv_dim,
+        ))
     }
 }
 
@@ -102,8 +129,102 @@ mod tests {
             Capability::DecodeProfile,
             Capability::PrefillQ4,
             Capability::HeterogeneousAttention,
+            Capability::PerLayerEmbeddings,
+            Capability::HybridAttention,
         ] {
             assert!(m.supports(cap), "{cap:?} should be advertised");
         }
+    }
+
+    /// `supports` rejects every capability MetalBackend does NOT
+    /// advertise — the `KvDispatch`-family flags (FusedAttentionStep,
+    /// WindowedAttentionStep, NativeKvCodec, PipelinedBoundaryUpload,
+    /// FusedResidualNorm, KvHandleNative). Those are reserved for the
+    /// AsyncComputeBackend Step A6 specialised shaders; Metal returns
+    /// `false` for them today so engines route through the CPU-fallback
+    /// path.
+    #[test]
+    fn supports_returns_false_for_unadvertised_kv_dispatch_flags() {
+        let m = backend();
+        for cap in [
+            Capability::FusedAttentionStep,
+            Capability::WindowedAttentionStep,
+            Capability::NativeKvCodec,
+            Capability::PipelinedBoundaryUpload,
+            Capability::FusedResidualNorm,
+            Capability::KvHandleNative,
+        ] {
+            assert!(
+                !m.supports(cap),
+                "{cap:?} must not be advertised until specialised shader lands"
+            );
+        }
+    }
+
+    /// `prepare_ple_inputs` trait override delegates to the inherent
+    /// method, which records the buffer + dims on the backend. Reading
+    /// back via the internal snapshot confirms the round-trip.
+    #[test]
+    fn prepare_ple_inputs_trait_dispatch_round_trips_data() {
+        let m = backend();
+        let num_layers = 4usize;
+        let ple_dim = 8usize;
+        let data: Vec<f32> = (0..num_layers * ple_dim).map(|i| i as f32).collect();
+        ComputeBackend::prepare_ple_inputs(&m, &data, num_layers, ple_dim);
+        let snap = m
+            .ple_inputs_snapshot()
+            .expect("prepare_ple_inputs must populate the cell");
+        assert_eq!(snap.num_layers, num_layers);
+        assert_eq!(snap.ple_dim, ple_dim);
+        assert_eq!(snap.positions, 1);
+        m.clear_ple_inputs();
+        assert!(m.ple_inputs_snapshot().is_none());
+    }
+
+    /// `take_split_timings` trait override reads back the thread-local
+    /// the Metal decode path writes to. Direct store + trait take.
+    #[test]
+    fn take_split_timings_trait_dispatch_returns_stored_value() {
+        // Clear any leakage from another test on this thread.
+        let _ = crate::decode::profile::take_last_split_timings();
+
+        let m = backend();
+        // Without a prior store, the trait method returns None.
+        assert!(ComputeBackend::take_split_timings(&m).is_none());
+
+        // After a manual store, the trait method consumes it.
+        let written = larql_compute::ProfileTimings {
+            attn_ms: 3.0,
+            gate_up_ms: 1.5,
+            down_ms: 0.5,
+        };
+        crate::decode::profile::store_last_split_timings(written);
+        let read = ComputeBackend::take_split_timings(&m).expect("must surface stored timing");
+        assert!((read.attn_ms - 3.0).abs() < 1e-9);
+        assert!((read.gate_up_ms - 1.5).abs() < 1e-9);
+        assert!((read.down_ms - 0.5).abs() < 1e-9);
+
+        // Consumed — second take is None.
+        assert!(ComputeBackend::take_split_timings(&m).is_none());
+    }
+
+    /// `hybrid_decode_attention_layer` trait dispatch reaches the
+    /// preamble (cache alloc + `as_mut()?`). The full attention
+    /// dispatch needs a vindex with `attn_kquant` data already loaded
+    /// and a populated KV cache — that end-to-end exercise lives in
+    /// `larql-inference`'s `predict_hybrid` integration tests where
+    /// the full path is wired against a real `VectorIndex`.
+    #[test]
+    fn hybrid_decode_attention_layer_trait_dispatch_preamble() {
+        let m = backend();
+        // Pre-allocate the cache for these shapes; covers `kv_cache_mut_for_shapes`
+        // which is the trait method's first line.
+        let kv_shapes = [(2usize, 4usize)];
+        let guard = m.kv_cache_mut_for_shapes(&kv_shapes);
+        assert!(guard.is_some());
+        drop(guard);
+        // Trait dispatch is reachable on `&dyn ComputeBackend`.
+        let any_backend: &dyn ComputeBackend = &m;
+        assert!(any_backend.supports(Capability::HybridAttention));
     }
 }

@@ -51,20 +51,34 @@ impl EncodedColdLayer {
 
 /// `RsStoreCodec` — per-layer hot residuals (f32) + per-layer codec-encoded
 /// cold residuals. Mirrors `RsStore` from the `markov_residual` engine, with
-/// the cold tier swapped for a byte-packed representation.
+/// the cold tier swapped for a byte-packed representation. `hot_kv`
+/// caches the K/V projection of the hot tier across decode steps
+/// (W2; see `RsStore` doc for invariants).
 pub struct RsStoreCodec {
+    /// Per-layer residual stream. W8.2: possibly over-allocated; valid
+    /// row count is `hot_len`, not `stored[l].shape()[0]`. See the
+    /// mirror [`crate::engines::markov_residual::store::RsStore`] doc
+    /// for the doubling-capacity contract.
     pub stored: Vec<Array2<f32>>,
     pub cold_encoded: Option<Vec<EncodedColdLayer>>,
     pub cold_kv: Option<Vec<SharedKV>>,
+    /// Per-layer hot K/V. Same over-allocation rule as `stored`.
+    pub hot_kv: Option<Vec<SharedKV>>,
     pub cold_abs_start: usize,
     pub next_position: usize,
     pub max_window: Option<usize>,
     pub codec: ColdResidualCodec,
+    /// W8.2: logical row count for `stored` / `hot_kv`. See field doc
+    /// on `stored`.
+    pub hot_len: usize,
 }
 
 impl RsStoreCodec {
     pub fn memory_bytes(&self) -> usize {
-        let hot: usize = self.stored.iter().map(|s| s.len() * 4).sum();
+        // W8.2: count only logically valid rows (hot_len), not the
+        // pre-allocated capacity.
+        let rows = self.hot_len;
+        let hot: usize = self.stored.iter().map(|s| rows * s.shape()[1] * 4).sum();
         let cold_enc: usize = self
             .cold_encoded
             .as_ref()
@@ -75,7 +89,16 @@ impl RsStoreCodec {
             .as_ref()
             .map(|kv| kv.iter().map(|(k, v)| (k.len() + v.len()) * 4).sum())
             .unwrap_or(0);
-        hot + cold_enc + cold_kv
+        let hot_kv: usize = self
+            .hot_kv
+            .as_ref()
+            .map(|kv| {
+                kv.iter()
+                    .map(|(k, v)| (k.shape()[1] + v.shape()[1]) * rows * 4)
+                    .sum()
+            })
+            .unwrap_or(0);
+        hot + cold_enc + cold_kv + hot_kv
     }
 
     pub fn cold_bytes(&self) -> usize {
@@ -93,28 +116,64 @@ impl RsStoreCodec {
     }
 
     pub fn window_tokens(&self) -> usize {
-        self.stored.first().map_or(0, |s| s.shape()[0])
+        // W8.2: use the logical-length counter.
+        self.hot_len
     }
 
     /// Clip the hot tier for `layer` against `max_window`. Returns the
     /// overflow as an `f32` block (the caller is responsible for encoding it
-    /// onto the cold tier).
+    /// onto the cold tier). Also clips `hot_kv` consistently when
+    /// present so the K/V cache stays aligned with the (smaller)
+    /// hot residual buffer.
     pub(crate) fn clip_layer_overflow(&mut self, layer: usize) -> Array2<f32> {
         let window = match self.max_window {
             Some(w) => w,
             None => return Array2::zeros((0, self.stored[layer].shape()[1])),
         };
-        let s_arr = &self.stored[layer];
-        let rows = s_arr.shape()[0];
-        let cols = s_arr.shape()[1];
+        // W8.2: use logical row count, not pre-allocated capacity.
+        let rows = self.hot_len;
+        let cols = self.stored[layer].shape()[1];
         if rows <= window {
             return Array2::zeros((0, cols));
         }
         let start = rows - window;
-        let overflow = s_arr.slice(s![..start, ..]).to_owned();
-        self.stored[layer] = s_arr.slice(s![start.., ..]).to_owned();
+        let s_logical = self.stored[layer].slice(s![..rows, ..]);
+        let overflow = s_logical.slice(s![..start, ..]).to_owned();
+        self.stored[layer] = s_logical.slice(s![start.., ..]).to_owned();
+        // Same `start..` slice keeps hot_kv aligned with stored. The
+        // evicted top rows are absorbed into cold_kv by the caller
+        // via `snapshot_evicted_hot_kv` (see `rs_decode_step_codec_walk`
+        // for the merge-into-cold flow).
+        if let Some(kv) = self.hot_kv.as_mut() {
+            let (k, v) = &kv[layer];
+            let k_logical = k.slice(s![..rows, ..]);
+            let v_logical = v.slice(s![..rows, ..]);
+            kv[layer] = (
+                k_logical.slice(s![start.., ..]).to_owned(),
+                v_logical.slice(s![start.., ..]).to_owned(),
+            );
+        }
+        // NB: do NOT update `self.hot_len` here — see RsStore::clip_layer
+        // for rationale. Callers must reset via
+        // `finalise_hot_len_after_clip()` after the per-layer loop.
         overflow
     }
+
+    /// Reset the logical row count after a window-clip loop. Call once
+    /// after `clip_layer_overflow` has been invoked for every layer.
+    pub(crate) fn finalise_hot_len_after_clip(&mut self) {
+        if let Some(w) = self.max_window {
+            self.hot_len = self.hot_len.min(w);
+        }
+    }
+
+    // NOTE: Unlike [`super::super::markov_residual::store::RsStore`],
+    // the codec engine does *not* expose `snapshot_evicted_hot_kv`.
+    // Its cold tier is codec-encoded (lossy under e.g. bf16), so the
+    // evicted raw K/V diverges from what would be recomputed against
+    // the round-tripped cold residual; we always invalidate cold_kv
+    // on overflow and let the next step recompute against the
+    // codec-decoded residual.
 }
 
 #[cfg(test)]
@@ -129,10 +188,12 @@ mod tests {
             stored,
             cold_encoded: None,
             cold_kv: None,
+            hot_kv: None,
             cold_abs_start: 0,
             next_position: seq_len,
             max_window: None,
             codec: ColdResidualCodec::Bf16,
+            hot_len: seq_len,
         }
     }
 

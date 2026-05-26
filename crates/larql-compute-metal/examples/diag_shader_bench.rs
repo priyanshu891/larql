@@ -1,12 +1,12 @@
 //! Full Metal shader bench and inventory.
 //!
 //! Usage:
-//!   cargo run --release --features metal -p larql-compute --example diag_shader_bench
-//!   cargo run --release --features metal -p larql-compute --example diag_shader_bench -- --profile gemma3 --json /tmp/shaders.json
+//!   cargo run --release --features gpu -p larql-compute --example diag_shader_bench
+//!   cargo run --release --features gpu -p larql-compute --example diag_shader_bench -- --profile gemma3 --json /tmp/shaders.json
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
-    eprintln!("This example requires macOS and --features metal");
+    eprintln!("This example requires macOS and --features gpu");
 }
 
 #[cfg(target_os = "macos")]

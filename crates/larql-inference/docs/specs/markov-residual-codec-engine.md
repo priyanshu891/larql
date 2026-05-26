@@ -6,6 +6,15 @@
 `MarkovResidualEngine` with a codec layer on its cold tier, trading
 bounded fidelity loss for cold-tier memory reduction.
 
+> **State Policy slot**: `(canonical = codec-encoded residuals,
+> derivative = hot K/V, contract = bounded_KL(ε))`. K/V is
+> derivative; the codec'd residuals are the canonical state, and
+> ε is stated per codec via the calibration sweep. Like
+> `MarkovResidualEngine`, the derivative-K/V classification lets
+> the engine drop the K/V shadow under W10 and reach
+> `standard`'s fused-kernel speed (98.1 tok/s, 2026-05-21).
+> See [state-policy.md §3.1](../../../larql-kv/docs/state-policy.md).
+
 This is engine 2 of 3 in the boundary-engine series. The siblings are
 [`BoundaryKvEngine`](boundary-kv-engine.md) (transport / save-restore,
 no in-session change) and `BoundaryPerLayerEngine` (per-layer codec
@@ -460,3 +469,23 @@ becomes "the simple 2× cold-saver" — a worthwhile addition, but
 narrower than the engine's design surface implies. That is the
 expected outcome and the spec is written to be defensible at that
 outcome.
+
+---
+
+## 14. W10 (2026-05-18) — state-bridge mask cascade (opt-in)
+
+Same as
+[`markov-residual-engine.md` §14](./markov-residual-engine.md#14-w10-2026-05-18--state-bridge-mask-cascade-opt-in):
+hot K/V is derivative state (the codec-encoded residual is the
+canonical cold tier; hot K/V is reprojectable). Under
+`LARQL_W10_HONLY=1`:
+
+| `window_size` | Mask | Engine shadow drops |
+|---|---|---|
+| `Some(N)` | `HOnly` | `hot_kv` |
+| `None` | `None` | `hot_kv` AND `rs.stored` |
+
+Preserves the `bounded_KL(ε)` contract — only the kernel→engine
+transfer path changes; the codec round-trip on the cold tier is
+unchanged. Measured: 88.3 → 98.5 tok/s under `None`, hot memory
+54.4 MB → 0 MB.
